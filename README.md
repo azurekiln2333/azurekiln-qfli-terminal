@@ -9,15 +9,15 @@ App -> QFLI 业务 API -> 127.0.0.1:3101 执行服务
 
 终端工作区是会话内存盘，重置、超时、服务重启或会话到期都会丢失。云项目仍由业务后端独立持久保存，不挂载进沙箱，不自动迁移旧终端目录。业务后端的云项目 Git 接口暂时关闭，普通项目、文件和同步接口保留。
 
-本服务面向用户运行任意代码，默认拒绝未满足隔离要求的宿主。必须使用 Linux、专用非 root 账号、rootless Docker、gVisor `runsc`、cgroup v2、有效的 CPU/内存/进程限制；缺一项就不开放执行。不会自动降级到普通 `runc` 或宿主 Shell。
+本服务面向用户运行任意代码，默认拒绝未满足隔离要求的宿主。必须使用 Linux、专用非 root 账号、rootless Docker、gVisor `runsc`、cgroup v2，以及执行账号上实际生效的 CPU/内存/任务数限制；缺一项就不开放执行。不会自动降级到普通 `runc` 或宿主 Shell。一次只保留一个用户会话，沙箱进程和执行服务、Docker daemon 共用该账号预算。
 
 公开运营优先部署在专用执行虚拟机。也可与业务同机使用独立账号，但共享内核与系统资源仍有风险；容器与 gVisor不能保证绝对不会逃逸，宿主内核、Docker、gVisor 和镜像必须及时更新。
 
 ## 安装前先检查宿主
 
-执行机须为 x86_64、cgroup v2，并运行 systemd **244 或更新版本**。gVisor 用 systemd 管理 cgroup 时会拒绝旧版本。当前 Alibaba Cloud Linux 3.2104 的 systemd 239 即使切换到 cgroup v2、成功构建镜像，也无法通过容器启动检查；不要在当前系统上继续重跑安装器、单独替换 systemd 或改用 `runc`。**不要求另买机器**：可以备份并迁移宝塔和业务后，在原 ECS 上安装 Ubuntu 24.04 LTS；也可以保留现有业务系统，另用独立执行机。两条路径都需要重新验收实际资源限额。
+执行机须为 x86_64、cgroup v2，且能运行带 `--ignore-cgroups` 的 gVisor。Alibaba Cloud Linux 3.2104 的 systemd 239 不支持 gVisor 自行创建 systemd cgroup，因此安装器改为让 gVisor 使用执行账号已有的受限 cgroup；不要求更换服务器或重装系统。Docker daemon 仍为 `qfli-runner` 账号的 rootless 服务。容器不声明虚假的独立 CPU/内存限额，执行服务会核对宿主上的实际账号限额及沙箱进程归属；核对失败就不开放终端。
 
-先在拟部署的执行机上运行 `systemctl --version | head -1` 和 `stat -fc %T /sys/fs/cgroup`；应看到 systemd 至少 244 和 `cgroup2fs`。安装器也会在任何下载和系统配置变更之前检查这两项。Ubuntu 24.04 仍需先准备专用 `qfli-runner` 账号、Docker Engine/CLI/rootless extras、从属 UID/GID 和 rootless Docker 前置条件，见下文“Linux 部署步骤”。不要在旧业务机上传或运行新安装器来尝试启动终端。
+先在执行机上运行 `systemctl --version | head -1` 和 `stat -fc %T /sys/fs/cgroup`；Alibaba Cloud Linux 3.2104 的 systemd 239 可用，但 cgroup 必须是 `cgroup2fs`。安装器会在下载前检查系统和 cgroup 模式。全新 Ubuntu 24.04 还需准备专用账号、Docker Engine/CLI/rootless extras、从属 UID/GID 和 rootless Docker 前置条件，见下文“Linux 部署步骤”。
 
 执行机具备上述条件后，把**整个新版** `azurekiln-qfli-terminal` 目录同步到 `/home/qfli-runner/azurekiln-qfli-terminal`。本地生成的 ZIP 不会自动出现在服务器的 `/root`；须先上传到执行机，再解压到执行账号的家目录。`unzip` 报找不到 ZIP 后，继续运行服务器上旧的安装器只会重复旧流程。从可信的上传目录将**新版**安装器复制到仅 root 可写的位置，然后在执行机的 root 终端运行：
 
@@ -30,7 +30,7 @@ bash /root/qfli-terminal-bootstrap.sh
 
 脚本会隐藏输入**业务后端已经使用的** 64 位十六进制终端密钥；不能在聊天或日志中粘贴密钥。已知业务 `.env` 路径时，也可运行 `bash /root/qfli-terminal-bootstrap.sh --business-env /实际业务后端目录/.env`，脚本只读取其中的 `QFLI_TERMINAL_SECRET`，不会复制业务配置到执行账号。若业务后端尚未配置终端密钥，先按下文“连接业务后端”配置两端相同的独立密钥。安装器不会替你修改或重启业务服务。
 
-脚本会优先从系统或宝塔已安装的 Node.js 22.9+ 复制一份到 `/usr/local/bin/qfli-node`；没有可用版本时从 Node.js 官网下载最新的 24.x Linux x64 包并校验 SHA-256。它还会校验 gVisor 下载、设置执行账号整体限额、配置专用 rootless Docker、构建沙箱镜像、写入专用密钥文件、安装终端用户服务，并以带认证的 `/health` 检查结果。下载和首次镜像构建可能需要几分钟；失败后修复报错并重新运行同一命令。服务已在运行时重跑只核对配置和健康状态，不重启正在运行的 Docker 或终端。安装器支持 Ubuntu 24.04；Alibaba Cloud Linux 3 仅在其 systemd 确实达到 244 或更高且其余检查通过时才会继续。
+脚本会优先从系统或宝塔已安装的 Node.js 22.9+ 复制一份到 `/usr/local/bin/qfli-node`；没有可用版本时从 Node.js 官网下载最新的 24.x Linux x64 包并校验 SHA-256。它还会校验 gVisor 下载、设置执行账号整体限额、配置专用 rootless Docker、构建沙箱镜像、写入专用密钥文件、安装终端用户服务，并以带认证的 `/health` 检查结果。下载和首次镜像构建可能需要几分钟；失败后修复报错并重新运行同一命令。服务已在运行时重跑只核对配置和健康状态，不重启正在运行的 Docker 或终端。安装器面向 Alibaba Cloud Linux 3 和 Ubuntu 24.04 的 cgroup v2 环境。
 
 在受支持的执行机升级旧版终端服务时，若服务因 Docker 启动失败而每 5 秒重启，先以 root 停止该专用用户服务，再上传新版目录并重新复制、运行安装器。安装器会迁移旧的 `runsc --rootless=true` 与单文件日志压缩设置，重启执行账号的 Docker，并先做一个无网络的 gVisor 容器启动检查；检查不通过时不会启动终端服务。
 
@@ -49,25 +49,25 @@ runuser -u qfli-runner -- env XDG_RUNTIME_DIR=/run/user/$runner_uid \
 
 | 项目 | 限额 |
 | --- | --- |
-| 总会话 / 同时执行 | 2 / 1，创建、命令及命令后清理占用执行槽 |
+| 总会话 / 同时执行 | 1 / 1，创建、命令及命令后清理占用执行槽 |
 | 等待队列 | FIFO 最多 8 条，最多等待 20 秒 |
 | 每用户 | 1 个会话；执行或等待请求合计最多 1 条 |
-| 每会话 CPU / 内存 / swap | 0.5 核 / 256 MiB / 0 |
-| 每会话进程数 | 64 |
-| `/workspace` / `/tmp` | 64 MiB / 32 MiB tmpfs |
-| 命令时间 / 合并输出 | 15 秒 / 100 KiB |
+| 执行账号整体 CPU / 内存 / swap | 1 核 / 1 GiB / 0；包含 Docker、gVisor、Node 与唯一沙箱 |
+| 执行账号宿主任务数 / 沙箱内用户任务数 | 1024 / 64，后者由 `nproc` 和 PID 1 监测 |
+| `/workspace` / `/tmp` | 256 MiB / 64 MiB tmpfs |
+| 命令时间 / 合并输出 | 60 秒 / 100 KiB |
 | 空闲期限 / 绝对期限 | 2 分钟 / 30 分钟 |
 | 项目快照 | 最多 64 文件、解码后合计 256 KiB；HTTP 请求最多 384 KiB |
-| 执行账号整体 | 1 核、MemoryHigh 768 MiB、MemoryMax 1 GiB、swap 0 |
+| 执行账号整体 | MemoryHigh 768 MiB、MemoryMax 1 GiB、TasksMax 1024；启动和每次命令前检查 |
 | 外网 | 完全关闭，包括下载包、SSH 与 Git 远程操作 |
 
 根文件系统只读，运行用户固定 `65532:65532`，所有 capabilities 被移除，启用 `no-new-privileges` 和默认 seccomp。不挂载宿主目录、设备、卷或 Docker socket，不共享宿主 PID/网络命名空间。`/workspace` 可以执行用户编译的程序，挂载仍带 `nosuid,nodev`；`/tmp` 另带 `noexec`。
 
 镜像内固定提供 Python 3、Node.js、GCC/G++、Make、Git、Lua 5.4、OpenJDK 17。镜像由管理员构建；用户不能在会话内安装系统包。内存和存储限额会限制大型编译或 JVM，程序可能失败或被终止。
 
-默认预算面向 2 核 / 2 GiB 小服务器：两份沙箱内存上限合计 512 MiB，账号的其余内存需容纳 Docker daemon、gVisor、执行 Node 和管理开销。账号 1 GiB 是强制上限，并非一定足够的内存保证；达到上限会造成 OOM 或服务不可用。剩余约 1 GiB 还需由 OS、业务 Node、数据库和宝塔共享，不能保证大型编译或大量用户可用。
+默认预算面向 2 核 / 2 GiB 小服务器：唯一沙箱与 rootless Docker、gVisor、执行 Node 共用账号的 1 核 / 1 GiB 硬上限。达到上限会造成 OOM 或终端服务不可用；OS、业务 Node、数据库和宝塔还需共用剩余资源。编译大型项目可能超出预算，不能仅因镜像包含编译器就承诺任意项目都能构建。
 
-排队只缓冲短时请求，不提高吞吐量。单个执行槽的命令最长 15 秒，另需初始化、上传与清理时间；连续长命令时，靠后的请求可能在 20 秒内等不到机会。空闲会话也计入 2 份容量；第三个新用户会立即收到“会话已满”，需等待退出释放、2 分钟空闲回收或手动重置。队列满与会话满使用不同提示，客户端断开、重置、等待超时或服务关闭会移除等待项并更新位置。删除失败仍占容量并停止新执行。需要持续服务更多用户时增加独立执行资源，不能只扩大队列。
+排队只缓冲短时请求，不提高吞吐量。单个执行槽的命令最长 60 秒，另需初始化、上传与清理时间；连续长命令时，靠后的请求可能在 20 秒内等不到机会。空闲会话仍占唯一容量；其他用户会收到“会话已满”，需等待退出释放、2 分钟空闲回收或手动重置。队列满与会话满使用不同提示，客户端断开、重置、等待超时或服务关闭会移除等待项并更新位置。删除失败仍占容量并停止新执行。需要持续服务更多用户时增加独立执行资源，不能只扩大队列。
 
 ## 请求与进度
 
@@ -81,9 +81,9 @@ runuser -u qfli-runner -- env XDG_RUNTIME_DIR=/run/user/$runner_uid \
 
 命令结束后只保留文件，全部后台进程被清理。清理不成功、命令超时、输出超额、连接断开、显式重置、到期或服务关闭，都销毁整个会话。PID 1 另有独立 30 分钟硬截止，执行服务死亡时依然生效。删除失败的会话继续占用容量，执行服务拒绝新增任务并持续尝试清理。
 
-执行服务会检查容器 `State.OOMKilled`、宿主实际 `memory.events` 的 `oom/oom_kill` 变化以及命令退出码 137；观察到 OOM 或 SIGKILL 退出就回收整个会话。gVisor 内部的 guest 内存耗尽不一定映射到这些宿主状态，例如子进程耗尽内存后被杀，但外层 Shell 忽略失败并返回 0。因此不能仅凭静态检查承诺所有 guest OOM 都必然触发回收；内存硬限额本身仍必须有效，并须在目标版本验证事件可见性。
+执行服务会检查容器 `State.OOMKilled` 与命令退出码 137；观察到 OOM 或 SIGKILL 退出就回收整个会话。账号级内存上限可能直接终止 Docker、gVisor 或 Node，服务会因此不可用而不接受新任务。gVisor 内部的 guest 内存耗尽不一定映射到这些宿主状态，例如子进程耗尽内存后被杀，但外层 Shell 忽略失败并返回 0。因此不能仅凭静态检查承诺所有 guest OOM 都必然触发回收；账号内存硬限额本身仍必须有效，并须在目标版本验证事件可见性。
 
-gVisor 的宿主线程和用户看到的进程不是一一对应关系，所以同时设置宿主 `pids.max` 与容器 `nproc=64:64`，并由 PID 1 每约 50 毫秒检查用户可见进程/线程总数，超额就退出整个会话。轮询不能保证瞬时数量绝不越界；目标 gVisor 版本的 guest `nproc` 行为必须在 Linux 上验收，不能只看宿主 cgroup 值就宣称用户进程限制已验证。
+gVisor 的宿主线程和用户看到的进程不是一一对应关系，所以账号级 `pids.max` 约束总宿主任务数，容器 `nproc=64:64` 与 PID 1 每约 50 毫秒检查用户可见进程/线程总数。轮询不能保证瞬时数量绝不越界；目标 gVisor 版本的 guest `nproc` 行为必须在 Linux 上验收，不能只看账号 cgroup 值就宣称用户进程限制已验证。
 
 PID 1 首先调用 `PR_SET_DUMPABLE=0` 并验证成功，安装信号处理后才写出一次性的启动就绪标记。受信 `ready.py` 在第一条用户命令前读取并删除该标记；后续不会信任用户可写的 `/tmp` 中的任何就绪文件。清理进程使用 `65532:65534`，用户命令为 `65532:65532`，通过不同 GID 阻止用户在清理进程启动瞬间使用 ptrace、`/proc/<pid>/mem` 或 `process_vm_writev` 修改它；清理进程还独立启用不可转储保护。保护不可用、就绪失败或 helper 身份不符都停止该会话。
 
@@ -100,7 +100,7 @@ PID 1 首先调用 `PR_SET_DUMPABLE=0` 并验证成功，安装信号处理后�
 
 ## Linux 部署步骤
 
-以下由服务器管理员在**受支持的执行机**上操作。假设使用 systemd 244+ 与 cgroup v2，独立账号名为 `qfli-runner`。安装器为执行服务准备 `/usr/local/bin/qfli-node`，建议 Node.js 24 LTS。宝塔的业务 Node 服务可继续使用自己的账号；不要把业务服务改成 `qfli-runner`。
+以下由服务器管理员在执行机上操作。需要 systemd 239+ 与 cgroup v2，独立账号名为 `qfli-runner`。安装器为执行服务准备 `/usr/local/bin/qfli-node`，建议 Node.js 24 LTS。宝塔的业务 Node 服务可继续使用自己的账号；不要把业务服务改成 `qfli-runner`。
 
 ### 1. 准备受支持的运行环境
 
@@ -116,13 +116,13 @@ grep '^qfli-runner:' /etc/subuid /etc/subgid
 
 账号不存在时先用 `useradd --create-home --shell /bin/bash qfli-runner` 创建，再运行 `passwd -l qfli-runner` 和 `loginctl enable-linger qfli-runner`。已有账号也要确认 linger 为 `yes`：`loginctl show-user qfli-runner -p Linger -p RuntimePath`；若为 `no`，执行 `loginctl enable-linger qfli-runner`。
 
-`stat` 必须显示 `cgroup2fs`，systemd 必须至少为 244；安装器会自行安装 `/usr/local/bin/qfli-node`。`/etc/subuid` 与 `/etc/subgid` 必须分配不少于 65536 个、不与其他账号冲突的从属 ID。按发行版的 rootless Docker 文档配置 systemd cgroup controller delegation；启动检测会读取实际宿主 cgroup 文件，不能只凭 Docker 的配置字段判断限额生效。
+`stat` 必须显示 `cgroup2fs`，systemd 必须至少为 239；安装器会自行安装 `/usr/local/bin/qfli-node`。`/etc/subuid` 与 `/etc/subgid` 必须分配不少于 65536 个、不与其他账号冲突的从属 ID。按发行版的 rootless Docker 文档配置 systemd cgroup controller delegation；启动检测会读取实际宿主 cgroup 文件，不能只凭 Docker 的配置字段判断限额生效。
 
 不要把任何业务账号加入 `docker` 组，不要使用 `sudo docker` 运行会话，也不要暴露 Docker daemon TCP 端口。执行账号只保管独立内部共享密钥，不能读取 MySQL、OAuth2 或 QFLI JWT 配置。核对业务 `.env` 的目录权限与文件权限，至少将文件限制为所属业务账号可读。
 
 #### 当前 Alibaba Cloud Linux 3.2104 的限制
 
-已观察到这台服务器虽然升级内核并启用了 cgroup v2，systemd 仍为 239；gVisor 容器启动时报 `systemd version 239 not supported, please upgrade to at least 244`。这是运行时与宿主 systemd 版本不兼容，重复构建镜像或再次重启无法解决。先禁用失败的终端服务。后续可在原 ECS 备份并重装受支持的系统、恢复业务和终端；也可保持原业务系统，单独部署执行机。不要在承载宝塔和业务的现有系统中手工替换系统级 systemd，也不要关闭容器 cgroup 或资源限制来掩盖这个错误。
+这台服务器已启用 cgroup v2，systemd 仍为 239。旧配置让 gVisor 自行申请 systemd cgroup，因而报 `systemd version 239 not supported`。新版改为 gVisor 不创建独立 cgroup，仍由 rootless Docker 的执行账号用户 slice 限制全部相关进程；同一时刻只准一个会话。先停止旧服务，上传新版目录后重跑安装器。必须等启动探针和实际账号限额检查通过，才能开放业务终端；不通过时不要关闭账号限额或切换 `runc`。
 
 ```sh
 runner_uid=$(id -u qfli-runner)
@@ -150,7 +150,7 @@ test -x /usr/local/bin/containerd-shim-runsc-v1
 test -d /usr/local/bin/gvisor-bin
 ```
 
-校验失败时停止安装。该目录的 `deployment/docker-daemon.json` 已为专用 rootless Docker 注册运行时；不要对宿主的 root Docker 运行 `runsc install` 来替代此配置。安装后以 `qfli-runner` 重启其用户级 Docker，并确认 `runsc` 仍在运行时列表中。Docker daemon 本身仍以非 root 账号运行；不要向 `runsc` 传 `--rootless=true`，当前 gVisor 的 OCI `create` 命令会明确拒绝该参数。运行时还传入 `--network=none`，执行服务启动前必须通过实际的 gVisor 容器和资源限制检查；失败时不切换到 `runc`。
+校验失败时停止安装。该目录的 `deployment/docker-daemon.json` 已为专用 rootless Docker 注册运行时；不要对宿主的 root Docker 运行 `runsc install` 来替代此配置。安装后以 `qfli-runner` 重启其用户级 Docker，并确认 `runsc` 仍在运行时列表中。Docker daemon 本身仍以非 root 账号运行；不要向 `runsc` 传 `--rootless=true`，当前 gVisor 的 OCI `create` 命令会明确拒绝该参数。运行时传入 `--network=none --ignore-cgroups`，因此容器本身不声明独立限额；服务启动前必须通过实际的 gVisor 容器、进程所属账号 cgroup 和账号资源限额检查；失败时不切换到 `runc`。
 
 ### 2. 设置执行账号整体资源上限
 
@@ -289,8 +289,8 @@ QFLI_TERMINAL_SECRET=与runner.env相同的独立内部密钥
 | `ECONNREFUSED`，`ss` 没有 `:3101` | 执行服务未监听；检查专用账号的 unit、`runner.env`、镜像及启动日志。 |
 | root 下 `systemctl --user` 报无法连接 bus | 切换到 `qfli-runner` 并设置其 `/run/user/<UID>` 环境；不要查 root 的用户服务。 |
 | Docker 列出 `runsc`，但 `/usr/local/bin/runsc` 不存在 | 仅注册了运行时名称；按上文安装完整 gVisor 包并重启专用 Docker。 |
-| `CgroupVersion=1` 或 `/sys/fs/cgroup` 为 `tmpfs` | 宿主仍为 cgroup v1；执行服务不能在此状态启动。先使用满足 systemd 244+、cgroup v2 的执行机。 |
-| `systemd version 239 not supported` | 当前宿主不满足 gVisor 的 systemd cgroup 要求；按上文禁用旧机终端服务，迁移到受支持的执行机。 |
+| `CgroupVersion=1` 或 `/sys/fs/cgroup` 为 `tmpfs` | 宿主仍为 cgroup v1；执行服务不能在此状态启动，需先启用 cgroup v2 并重启宿主。 |
+| `systemd version 239 not supported` | 服务器仍在运行旧的 `runsc` 参数；停止旧服务，上传新版目录，重跑安装器迁移 rootless Docker 配置并检查账号限额。 |
 | `No such image: qfli-terminal-sandbox:1` | 以 `qfli-runner` 构建镜像，确认使用同一个 rootless Docker socket。 |
 | `Rootless mode not supported with "create"` | 旧配置给 `runsc` 传了 `--rootless=true`；停止重启中的终端服务，上传新版目录并重跑安装器迁移专用 Docker 配置。 |
 | `compression cannot be enabled when max file count is 1` | 专用 Docker 的 `local` 日志驱动需配置 `"compress":"false"`；新版安装器会迁移旧配置。 |
@@ -310,11 +310,11 @@ QFLI_TERMINAL_SECRET=与runner.env相同的独立内部密钥
 
 本仓库只做了静态检查，当前 Windows 开发环境没有 Docker，尚未完成 Linux 下真实 gVisor 运行验证。公开入口开放前，管理员必须在目标机器确认：
 
-1. 启动检查成功，日志确认 Linux/rootless/cgroup v2/seccomp/runsc、可信 image ID 和宿主实际 cgroup 限额。
-2. 沙箱 inspect 中 rootfs 只读、无 privileged/host namespaces/宿主 mounts、network none、capabilities 全移除、uid 65532、CPU 0.5、memory 256 MiB、swap 0、pids 64；宿主对应 `cpu.max`、`memory.max`、`memory.swap.max`、`pids.max` 与其一致。磁盘由 tmpfs 实际大小限制。
-3. 普通命令可运行；后台进程不能跨命令存活；区分并验证 gVisor 宿主 `pids.max` 与 guest `nproc=64:64`，包括进程/线程风暴和 PID 1 兜底退出；输出超额、命令超时、客户端断开、进程超额或被观察到的 OOM 后会话被销毁；服务启动时清理带专用所有权标签的遗留容器。
+1. 启动检查成功，日志确认 Linux/rootless/cgroup v2/seccomp/runsc、可信 image ID、单会话容量和账号级实际 cgroup 限额。
+2. 沙箱 inspect 中 rootfs 只读、无 privileged/host namespaces/宿主 mounts、network none、capabilities 全移除、uid 65532；`/proc/<沙箱 PID>/cgroup` 必须落在 `user-<UID>.slice` 下，账号实际 `cpu.max` 不超过 1 核、`memory.max` 不超过 1 GiB、`memory.swap.max` 为 0、`pids.max` 不超过 1024。磁盘由 tmpfs 实际大小限制。
+3. 普通命令可运行；后台进程不能跨命令存活；区分并验证账号宿主 `pids.max` 与 guest `nproc=64:64`，包括进程/线程风暴和 PID 1 兜底退出；输出超额、命令超时、客户端断开、进程超额或被观察到的 OOM 后会话被销毁；服务启动时清理带专用所有权标签的遗留容器。
 4. 用户无法联网、读取宿主业务目录或获取业务环境变量；多个用户的工作区互不访问；重置会丢失会话文件，云项目文件不受影响。
-5. 验证单执行槽、2 份会话容量、FIFO 8 条等待/20 秒期限及每用户互斥；创建/执行后清理仍占执行槽，等待不预留沙箱。验证位置更新、等待超时、断开、重置及关闭移除等待项。会话已满或队列已满分别拒绝；Docker 故障或删除失败时进入不可执行状态，不把未清理资源视为已释放。
+5. 验证单执行槽、1 份会话容量、FIFO 8 条等待/20 秒期限及每用户互斥；创建/执行后清理仍占执行槽，等待不预留沙箱。验证位置更新、等待超时、断开、重置及关闭移除等待项。会话已满或队列已满分别拒绝；Docker 故障或删除失败时进入不可执行状态，不把未清理资源视为已释放。
 6. 验证所部署 gVisor 的 PID 命名空间 init 语义：用户进程不能 SIGSTOP 暂停 PID 1 或通过 ptrace、proc mem、process_vm 修改 PID 1/helper，清理进程不同 GID 与不可转储保护确实生效。无法满足时禁止开放终端，不能用宿主 Yama 默认值代替该验证。
 7. 验证直接耗尽内存的命令，以及“子进程耗尽内存后被杀、Shell 忽略退出结果继续返回 0”两种 OOM 情况。核对实际内存上限、guest 程序行为、`State.OOMKilled` 和 `memory.events`；观察到 OOM 时必须回收，无法观察到的 guest OOM 应记录为该运行时的验收限制，不能宣称已完整覆盖。
 

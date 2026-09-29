@@ -4,11 +4,11 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 export const requestContext = new AsyncLocalStorage();
 
 export const limits = Object.freeze({
-  sessions: 2,
+  sessions: 1,
   running: 1,
   waiting: 8,
   queueMs: 20_000,
-  commandMs: 15_000,
+  commandMs: 60_000,
   managementMs: 10_000,
   outputBytes: 100 * 1024,
   bodyBytes: 384 * 1024,
@@ -16,8 +16,8 @@ export const limits = Object.freeze({
   snapshotBytes: 256 * 1024,
   idleMs: 2 * 60_000,
   leaseMs: 30 * 60_000,
-  memoryBytes: 256 * 1024 * 1024,
-  pids: 64,
+  memoryBytes: 1024 * 1024 * 1024,
+  pids: 1024,
 });
 
 export function configuration() {

@@ -92,11 +92,10 @@ export class Sessions {
         '--label', owner, '--runtime', 'runsc', '--network', 'none', '--ipc', 'private',
         '--hostname', 'sandbox', '--read-only',
         '--user', '65532:65532', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
-        '--memory', String(limits.memoryBytes), '--memory-swap', String(limits.memoryBytes),
-        '--cpus', '0.5', '--pids-limit', String(limits.pids), '--shm-size', '1m',
+        '--shm-size', '1m',
         '--ulimit', 'nofile=256:256', '--ulimit', 'core=0:0', '--ulimit', 'nproc=64:64',
-        '--tmpfs', '/workspace:rw,nosuid,nodev,size=64m,mode=0700,uid=65532,gid=65532',
-        '--tmpfs', '/tmp:rw,nosuid,nodev,noexec,size=32m,mode=1777',
+        '--tmpfs', '/workspace:rw,nosuid,nodev,size=256m,mode=0700,uid=65532,gid=65532',
+        '--tmpfs', '/tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777',
         '--workdir', '/workspace', '--env', 'HOME=/workspace', '--env', 'LANG=C.UTF-8',
         '--env', 'PATH=/usr/local/bin:/usr/bin:/bin', '--log-driver', 'none', this.imageId]);
     } catch (error) {

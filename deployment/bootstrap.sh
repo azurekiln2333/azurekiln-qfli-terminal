@@ -14,7 +14,7 @@ node_bin=/usr/local/bin/qfli-node
 usage() {
   printf '%s\n' \
     'Usage: bash deployment/bootstrap.sh [--business-env /path/to/backend/.env] [--registry-mirror HTTPS_URL] [--debian-mirror URL]' \
-    'Run as root on Ubuntu 24.04 or a compatible Alibaba Cloud Linux 3 host with systemd >= 244.' \
+    'Run as root on Ubuntu 24.04 or Alibaba Cloud Linux 3 with cgroup v2.' \
     'An existing backend secret is required.' \
     'Without --business-env, the script prompts for that secret without echoing it.'
 }
@@ -74,13 +74,12 @@ done
 case "${ID:-}:${VERSION_ID:-}" in
   ubuntu:24.04*) package_manager=apt-get ;;
   alinux:3*) package_manager=dnf ;;
-  *) fail 'supported hosts: Ubuntu 24.04 or Alibaba Cloud Linux 3 with systemd >= 244' ;;
+  *) fail 'supported hosts: Ubuntu 24.04 or Alibaba Cloud Linux 3' ;;
 esac
 [[ "$(uname -m)" == x86_64 ]] || fail 'this installer expects x86_64'
 systemd_version=$(systemctl --version | awk 'NR == 1 { print $2 }')
 [[ "$systemd_version" =~ ^[0-9]+$ ]] || fail 'cannot determine the host systemd version'
-((systemd_version >= 244)) ||
-  fail "systemd $systemd_version is unsupported by gVisor cgroup v2 (requires >= 244); use a supported OS on this ECS or a separate executor host"
+((systemd_version >= 239)) || fail 'systemd 239 or newer is required for the dedicated user slice'
 [[ "$(stat -fc %T /sys/fs/cgroup)" == cgroup2fs ]] ||
   fail 'cgroup v2 is not active; follow README.md to enable it and reboot first'
 for command in awk cmp curl docker flock getent install loginctl runuser sha256sum sha512sum systemctl tar "$package_manager"; do
@@ -245,19 +244,21 @@ else
     const args = JSON.stringify(runtime?.runtimeArgs);
     const previous = JSON.stringify(["--rootless=true", "--network=none"]);
     const current = JSON.stringify(["--network=none"]);
-    if (runtime?.path !== "/usr/local/bin/runsc" || (args !== previous && args !== current)) {
+    const target = JSON.stringify(["--network=none", "--ignore-cgroups"]);
+    if (runtime?.path !== "/usr/local/bin/runsc" ||
+        ![previous, current, target].includes(args)) {
       console.error("rootless Docker runsc settings do not match deployment/docker-daemon.json");
       process.exit(1);
     }
     const logs = data["log-opts"];
     const fixLogs = data["log-driver"] === "local" && logs?.["max-file"] === "1" &&
       logs.compress !== "false";
-    if (args === previous || fixLogs) {
+    if (args !== target || fixLogs) {
       if (process.argv[2] === "1") {
         console.error("stop the running executor before migrating its Docker configuration");
         process.exit(1);
       }
-      runtime.runtimeArgs = ["--network=none"];
+      runtime.runtimeArgs = ["--network=none", "--ignore-cgroups"];
       if (fixLogs) logs.compress = "false";
       const temp = `${file}.${process.pid}.tmp`;
       fs.writeFileSync(temp, `${JSON.stringify(data, null, 2)}\n`, { flag: "wx", mode: 0o600 });
@@ -305,6 +306,8 @@ if ((service_running == 0)); then
 fi
 [[ "$(as_runner docker info --format '{{.CgroupVersion}}')" == 2 ]] ||
   fail 'rootless Docker is not using cgroup v2'
+[[ "$(as_runner docker info --format '{{.CgroupDriver}}')" == systemd ]] ||
+  fail 'rootless Docker must use the systemd cgroup driver for account-wide limits'
 security_options=$(as_runner docker info --format '{{json .SecurityOptions}}')
 [[ "$security_options" == *'name=rootless'* && \
    "$security_options" == *'name=seccomp,profile=builtin'* ]] ||
@@ -337,12 +340,11 @@ if ! as_runner docker image inspect qfli-terminal-sandbox:1 >/dev/null 2>&1; the
     fail 'sandbox build failed; if Docker Hub is unreachable, rerun with --registry-mirror and your trusted HTTPS Docker Hub accelerator'
 fi
 
-step 'checking gVisor container startup under rootless Docker'
+step 'checking gVisor container startup under the bounded rootless account'
 as_runner docker run --rm --pull=never --runtime=runsc --network=none \
   --log-driver=none --read-only --user=65532:65532 --cap-drop=ALL \
-  --security-opt=no-new-privileges --memory=268435456 --memory-swap=268435456 \
-  --cpus=0.5 --pids-limit=64 --tmpfs=/workspace:rw,nosuid,nodev,size=64m,mode=0700,uid=65532,gid=65532 \
-  --tmpfs=/tmp:rw,nosuid,nodev,noexec,size=32m,mode=1777 \
+  --security-opt=no-new-privileges --tmpfs=/workspace:rw,nosuid,nodev,size=256m,mode=0700,uid=65532,gid=65532 \
+  --tmpfs=/tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777 \
   --entrypoint=/usr/bin/true qfli-terminal-sandbox:1 ||
   fail 'gVisor startup under the dedicated rootless Docker daemon failed'
 

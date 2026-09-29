@@ -4,6 +4,17 @@ import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import { ExecutorError, limits, log } from './config.js';
 
+export function accountBudgetValid({ memory, swap, pids, cpu }) {
+  const bounded = (value, max) => /^\d+$/.test(value.trim()) &&
+    Number(value) > 0 && Number(value) <= max;
+  const cpuParts = cpu.trim().split(/\s+/);
+  return bounded(memory, limits.memoryBytes) && swap.trim() === '0' &&
+    bounded(pids, limits.pids) && cpuParts.length === 2 &&
+    bounded(cpuParts[0], Number.MAX_SAFE_INTEGER) &&
+    bounded(cpuParts[1], Number.MAX_SAFE_INTEGER) &&
+    Number(cpuParts[0]) <= Number(cpuParts[1]);
+}
+
 export class Docker {
   constructor(config) { this.config = config; }
 
@@ -123,9 +134,15 @@ export class Docker {
     if (!socket.isSocket() || socket.uid !== this.config.uid) throw new ExecutorError('docker_socket_invalid');
     const info = await this.json(['info', '--format', '{{json .}}']);
     if (info.OSType !== 'linux' || info.CgroupVersion !== '2' ||
+        info.CgroupDriver !== 'systemd' ||
         !info.SecurityOptions?.some(item => item === 'name=rootless') ||
         !info.SecurityOptions?.includes('name=seccomp,profile=builtin') ||
-        !info.Runtimes?.runsc) throw new ExecutorError('docker_required_isolation_missing');
+        info.Runtimes?.runsc?.path !== '/usr/local/bin/runsc' ||
+        JSON.stringify(info.Runtimes.runsc.runtimeArgs) !==
+          JSON.stringify(['--network=none', '--ignore-cgroups'])) {
+      throw new ExecutorError('docker_required_isolation_missing');
+    }
+    await this.validateAccountBudget();
     const images = await this.json(['image', 'inspect', '--', this.config.image]);
     const image = images[0];
     const expectedEntry = ['/usr/bin/python3', '-I', '/usr/local/lib/qfli/init.py'];
@@ -138,14 +155,26 @@ export class Docker {
     return image.Id;
   }
 
+  async validateAccountBudget() {
+    const base = `/sys/fs/cgroup/user.slice/user-${this.config.uid}.slice`;
+    const state = await lstat(base);
+    if (!state.isDirectory() || state.uid !== 0) throw new ExecutorError('account_cgroup_invalid');
+    const [memory, swap, pids, cpu] = await Promise.all(
+      ['memory.max', 'memory.swap.max', 'pids.max', 'cpu.max']
+        .map(file => readFile(path.join(base, file), 'utf8')));
+    if (!accountBudgetValid({ memory, swap, pids, cpu })) {
+      throw new ExecutorError('sandbox_resource_controls_missing');
+    }
+  }
+
   async validateContainer(name, imageId) {
     const values = await this.json(['inspect', '--type', 'container', '--', name]);
     const container = values[0];
     if (container?.State?.OOMKilled) throw new ExecutorError('sandbox_resource_terminated', 409);
     const host = container?.HostConfig;
     const expectedTmpfs = {
-      '/workspace': 'rw,nosuid,nodev,size=64m,mode=0700,uid=65532,gid=65532',
-      '/tmp': 'rw,nosuid,nodev,noexec,size=32m,mode=1777',
+      '/workspace': 'rw,nosuid,nodev,size=256m,mode=0700,uid=65532,gid=65532',
+      '/tmp': 'rw,nosuid,nodev,noexec,size=64m,mode=1777',
     };
     const expectedUlimits = { nproc: 64, nofile: 256, core: 0 };
     if (values.length !== 1 || !container.State?.Running || container.Image !== imageId ||
@@ -168,29 +197,11 @@ export class Docker {
     const membership = await readFile(`/proc/${container.State.Pid}/cgroup`, 'utf8');
     const entry = membership.trim().split('\n').find(line => line.startsWith('0::'));
     const relative = entry?.slice(3);
-    if (!relative?.startsWith('/') || relative.split('/').includes('..')) throw new ExecutorError('sandbox_cgroup_invalid');
-    const base = path.join('/sys/fs/cgroup', relative);
-    const [memory, swap, pids, cpu, memoryEvents] = await Promise.all(
-      ['memory.max', 'memory.swap.max', 'pids.max', 'cpu.max', 'memory.events']
-        .map(file => readFile(path.join(base, file), 'utf8')));
-    const bounded = (value, max) => /^\d+$/.test(value.trim()) && Number(value) > 0 && Number(value) <= max;
-    const cpuParts = cpu.trim().split(/\s+/);
-    if (!bounded(memory, limits.memoryBytes) || swap.trim() !== '0' || !bounded(pids, limits.pids) ||
-        cpuParts.length !== 2 || !bounded(cpuParts[0], Number.MAX_SAFE_INTEGER) ||
-        !bounded(cpuParts[1], Number.MAX_SAFE_INTEGER) || Number(cpuParts[0]) / Number(cpuParts[1]) > 0.5) {
-      throw new ExecutorError('sandbox_resource_controls_missing');
+    const account = `/user.slice/user-${this.config.uid}.slice/`;
+    if (!relative?.startsWith(account) || relative.split('/').includes('..')) {
+      throw new ExecutorError('sandbox_cgroup_invalid');
     }
-    const eventRows = memoryEvents.trim().split('\n').map(line => line.trim().split(/\s+/));
-    if (eventRows.some(row => row.length !== 2 || !/^[a-z_]+$/.test(row[0]) || !/^\d+$/.test(row[1]))) {
-      throw new ExecutorError('sandbox_resource_controls_missing');
-    }
-    const events = new Map(eventRows);
-    if (events.size !== eventRows.length || !events.has('oom') || !events.has('oom_kill')) {
-      throw new ExecutorError('sandbox_resource_controls_missing');
-    }
-    if (!/^0+$/.test(events.get('oom')) || !/^0+$/.test(events.get('oom_kill'))) {
-      throw new ExecutorError('sandbox_resource_terminated', 409);
-    }
+    await this.validateAccountBudget();
     return container.Id;
   }
 }

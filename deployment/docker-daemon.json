@@ -2,7 +2,7 @@
   "runtimes": {
     "runsc": {
       "path": "/usr/local/bin/runsc",
-      "runtimeArgs": ["--network=none"]
+      "runtimeArgs": ["--network=none", "--ignore-cgroups"]
     }
   },
   "log-driver": "local",
