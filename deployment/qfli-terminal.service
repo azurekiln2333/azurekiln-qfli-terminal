@@ -1,0 +1,28 @@
+[Unit]
+Description=QFLI isolated terminal executor
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/azurekiln-qfli-terminal
+EnvironmentFile=%h/.config/qfli-terminal/runner.env
+Environment=HOME=%h
+Environment=XDG_RUNTIME_DIR=%t
+Environment=DOCKER_HOST=unix://%t/docker.sock
+ExecStart=/usr/local/bin/qfli-node %h/azurekiln-qfli-terminal/src/server.js
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=60
+KillMode=mixed
+UMask=0077
+LimitNOFILE=4096
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%t
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,14 @@
+{
+  "runtimes": {
+    "runsc": {
+      "path": "/usr/local/bin/runsc",
+      "runtimeArgs": ["--network=none"]
+    }
+  },
+  "log-driver": "local",
+  "log-opts": {
+    "max-size": "1m",
+    "max-file": "1",
+    "compress": "false"
+  }
+}
