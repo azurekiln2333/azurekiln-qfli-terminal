@@ -1,19 +1,23 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 export LC_ALL=C
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 umask 077
 
 runner=qfli-runner
 business_env=''
 debian_mirror='http://mirrors.tuna.tsinghua.edu.cn'
 registry_mirror=''
+base_image=debian:trixie-slim
+input_source=''
+sandbox_image=qfli-terminal-sandbox:2
 download_dir=''
 node_download_dir=''
 node_bin=/usr/local/bin/qfli-node
 
 usage() {
   printf '%s\n' \
-    'Usage: bash deployment/bootstrap.sh [--business-env /path/to/backend/.env] [--registry-mirror HTTPS_URL] [--debian-mirror URL]' \
+    'Usage: bash deployment/bootstrap.sh [--source-dir PATH] [--business-env PATH] [--registry-mirror HTTPS_URL] [--debian-mirror URL] [--base-image IMAGE]' \
     'Run as root on Ubuntu 24.04 or Alibaba Cloud Linux 3 with cgroup v2.' \
     'An existing backend secret is required.' \
     'Without --business-env, the script prompts for that secret without echoing it.'
@@ -46,6 +50,11 @@ while (($#)); do
       business_env=$2
       shift 2
       ;;
+    --source-dir)
+      (($# >= 2)) || fail '--source-dir requires a path'
+      input_source=$2
+      shift 2
+      ;;
     --debian-mirror)
       (($# >= 2)) || fail '--debian-mirror requires a URL'
       debian_mirror=$2
@@ -54,6 +63,11 @@ while (($#)); do
     --registry-mirror)
       (($# >= 2)) || fail '--registry-mirror requires an HTTPS URL'
       registry_mirror=$2
+      shift 2
+      ;;
+    --base-image)
+      (($# >= 2)) || fail '--base-image requires an administrator-selected trusted image'
+      base_image=$2
       shift 2
       ;;
     -h|--help)
@@ -82,12 +96,90 @@ systemd_version=$(systemctl --version | awk 'NR == 1 { print $2 }')
 ((systemd_version >= 239)) || fail 'systemd 239 or newer is required for the dedicated user slice'
 [[ "$(stat -fc %T /sys/fs/cgroup)" == cgroup2fs ]] ||
   fail 'cgroup v2 is not active; follow README.md to enable it and reboot first'
-for command in awk cmp curl docker flock getent install loginctl runuser sha256sum sha512sum systemctl tar "$package_manager"; do
+for command in awk flock systemctl "$package_manager"; do
   command -v "$command" >/dev/null || fail "missing command: $command"
 done
 exec 9>/run/lock/qfli-terminal-bootstrap.lock
 flock -n 9 || fail 'another terminal installation is already running'
 [[ ! -L "$node_bin" ]] || fail 'dedicated Node.js path must not be a symlink'
+
+configure_al3_docker_repo() {
+  printf '%s\n' '[docker-ce-stable]' 'name=Docker CE Stable - x86_64' \
+    'baseurl=https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/centos/8/x86_64/stable https://download.docker.com/linux/centos/8/x86_64/stable' \
+    'enabled=1' 'gpgcheck=1' 'gpgkey=https://download.docker.com/linux/centos/gpg' \
+    > /etc/yum.repos.d/qfli-docker.repo
+}
+if [[ "$package_manager" == dnf && -f /etc/yum.repos.d/qfli-docker.repo ]]; then
+  configure_al3_docker_repo
+fi
+
+step 'preparing host packages for rootless Docker'
+needs_packages=0
+for command in curl newuidmap newgidmap dbus-daemon slirp4netns fuse-overlayfs xz zstd \
+  tar cmp getent install loginctl runuser sha256sum sha512sum realpath find sort xargs useradd usermod passwd ps ip; do
+  command -v "$command" >/dev/null || needs_packages=1
+done
+if ((needs_packages)); then
+  if [[ "$package_manager" == apt-get ]]; then
+    apt-get --error-on=any update
+    apt-get install -y ca-certificates curl uidmap dbus-user-session \
+      slirp4netns fuse-overlayfs xz-utils zstd tar coreutils util-linux findutils passwd procps iproute2
+  else
+    dnf install -y ca-certificates curl shadow-utils dbus-daemon \
+      slirp4netns fuse-overlayfs xz zstd tar coreutils util-linux findutils passwd procps-ng iproute
+  fi
+fi
+if [[ "$package_manager" == dnf ]] && ! slirp4netns --version >/dev/null 2>&1; then
+  step 'updating glib2 required by the AL3 libslirp package'
+  dnf upgrade -y glib2
+fi
+slirp4netns --version >/dev/null || fail 'slirp4netns is installed but cannot run'
+fuse-overlayfs --version >/dev/null || fail 'fuse-overlayfs is installed but cannot run'
+
+if ! command -v docker >/dev/null; then
+  step 'installing Docker from its signed official repository'
+  if [[ "$package_manager" == apt-get ]]; then
+    install -d -m 0755 /etc/apt/keyrings
+    curl --fail --location --retry 3 --output /etc/apt/keyrings/qfli-docker.asc \
+      https://download.docker.com/linux/ubuntu/gpg
+    chmod 0644 /etc/apt/keyrings/qfli-docker.asc
+    printf '%s\n' 'deb [arch=amd64 signed-by=/etc/apt/keyrings/qfli-docker.asc] https://download.docker.com/linux/ubuntu noble stable' \
+      > /etc/apt/sources.list.d/qfli-docker.list
+    apt-get update
+    apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-ce-rootless-extras
+  else
+    configure_al3_docker_repo
+    dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-ce-rootless-extras
+  fi
+elif ! command -v dockerd-rootless-setuptool.sh >/dev/null; then
+  if [[ "$package_manager" == apt-get ]]; then
+    apt-get install -y docker-ce-rootless-extras
+  else
+    configure_al3_docker_repo
+    dnf install -y docker-ce-rootless-extras
+  fi
+fi
+for command in docker dockerd-rootless-setuptool.sh newuidmap newgidmap; do
+  command -v "$command" >/dev/null || fail "rootless Docker prerequisite is missing: $command"
+done
+
+if ! id "$runner" >/dev/null 2>&1; then
+  useradd --create-home --shell /bin/bash "$runner"
+  passwd -l "$runner" >/dev/null
+fi
+[[ "$(id -u "$runner")" != 0 ]] || fail 'the runner must be non-root'
+for mapping in /etc/subuid /etc/subgid; do
+  if ! awk -F: -v user="$runner" '$1 == user && $3 >= 65536 { found=1 } END { exit !found }' "$mapping"; then
+    first=$(awk -F: 'BEGIN { next_id=100000 } $2+$3 > next_id { next_id=$2+$3 } END { print next_id }' "$mapping")
+    last=$((first + 65535))
+    ((last < 2147483647)) || fail 'no available subordinate ID range'
+    if [[ "$mapping" == /etc/subuid ]]; then
+      usermod --add-subuids "$first-$last" "$runner"
+    else
+      usermod --add-subgids "$first-$last" "$runner"
+    fi
+  fi
+done
 
 node_supported() {
   env -i PATH=/usr/bin:/bin "$1" -e '
@@ -144,9 +236,16 @@ runner_uid=$(id -u "$runner") || fail "missing account: $runner"
 runner_home=$(getent passwd "$runner" | cut -d: -f6)
 [[ -d "$runner_home" ]] || fail "missing runner home: $runner_home"
 source_dir="$runner_home/azurekiln-qfli-terminal"
-[[ -f "$source_dir/src/server.js" && -f "$source_dir/deployment/qfli-terminal.service" && \
-   -f "$source_dir/deployment/check-health.mjs" && \
-   -f "$source_dir/deployment/docker-daemon.json" && -f "$source_dir/sandbox/Dockerfile" ]] ||
+if [[ -n "$input_source" ]]; then
+  input_source=$(realpath -- "$input_source")
+  [[ -f "$input_source/src/server.js" && -f "$input_source/sandbox/smoke-languages.sh" && \
+     -f "$input_source/deployment/verify-runtime.mjs" ]] || fail 'source directory is incomplete'
+fi
+release_source=${input_source:-$source_dir}
+[[ -f "$release_source/src/server.js" && -f "$release_source/deployment/qfli-terminal.service" && \
+   -f "$release_source/deployment/check-health.mjs" && \
+   -f "$release_source/deployment/verify-runtime.mjs" && -f "$release_source/sandbox/smoke-languages.sh" && \
+   -f "$release_source/deployment/docker-daemon.json" && -f "$release_source/sandbox/Dockerfile" ]] ||
   fail "install the current source at $source_dir before running this script"
 
 as_runner() {
@@ -191,12 +290,33 @@ unset business_secret
 step 'starting the dedicated user manager'
 loginctl enable-linger "$runner"
 systemctl start "user@$runner_uid.service"
-service_running=0
+source_fingerprint=$(
+  cd "$release_source"
+  find src sandbox deployment -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d " " -f1
+)
+receipt="$runner_home/.config/qfli-terminal/validated-source.sha256"
 if as_runner systemctl --user is-active --quiet qfli-terminal.service; then
-  service_running=1
   installed_unit="$runner_home/.config/systemd/user/qfli-terminal.service"
-  cmp -s "$source_dir/deployment/qfli-terminal.service" "$installed_unit" ||
-    fail 'running unit differs from this release; upgrade it during a maintenance window'
+  previous_fingerprint=$(as_runner cat "$receipt" 2>/dev/null || true)
+  if [[ "$previous_fingerprint" == "$source_fingerprint" ]] && \
+     [[ -z "$registry_mirror" && "$base_image" == debian:trixie-slim && \
+        "$debian_mirror" == http://mirrors.tuna.tsinghua.edu.cn ]] && \
+     cmp -s "$release_source/deployment/qfli-terminal.service" "$installed_unit"; then
+    step 'this release already runs; checking authenticated health'
+    as_runner "$node_bin" "$source_dir/deployment/check-health.mjs"
+    as_runner systemctl --user enable qfli-terminal.service
+    printf 'QFLI terminal setup: installed and enabled at boot\n'
+    exit 0
+  fi
+fi
+if as_runner systemctl --user cat qfli-terminal.service >/dev/null 2>&1; then
+  step 'stopping the previous executor for verified upgrade'
+  as_runner systemctl --user disable --now qfli-terminal.service
+fi
+if [[ "$release_source" != "$source_dir" ]]; then
+  as_runner install -d -m 0755 "$source_dir"
+  tar -C "$release_source" -cf - src sandbox deployment test docs package.json README.md .env.example | \
+    as_runner tar -C "$source_dir" --no-same-owner -xf -
 fi
 
 step 'installing account resource limits'
@@ -217,9 +337,11 @@ if [[ ! -x /usr/local/bin/runsc || ! -x /usr/local/bin/containerd-shim-runsc-v1 
   fi
   download_dir=$(mktemp -d /var/tmp/qfli-gvisor.XXXXXXXX)
   release_url='https://storage.googleapis.com/gvisor/releases/release/latest/x86_64'
-  curl --fail --location --retry 3 --output "$download_dir/gvisor.tar.zstd" \
+  curl --fail --location --ipv4 --tls-max 1.2 --retry 3 --retry-max-time 900 \
+    --connect-timeout 15 --max-time 600 --output "$download_dir/gvisor.tar.zstd" \
     "$release_url/gvisor.tar.zstd"
-  curl --fail --location --retry 3 --output "$download_dir/gvisor.tar.zstd.sha512" \
+  curl --fail --location --ipv4 --tls-max 1.2 --retry 3 --retry-max-time 90 \
+    --connect-timeout 15 --max-time 60 --output "$download_dir/gvisor.tar.zstd.sha512" \
     "$release_url/gvisor.tar.zstd.sha512"
   (cd "$download_dir" && sha512sum -c gvisor.tar.zstd.sha512)
   zstd -dc "$download_dir/gvisor.tar.zstd" | tar -xf - -C /usr/local/bin
@@ -254,22 +376,17 @@ else
     const fixLogs = data["log-driver"] === "local" && logs?.["max-file"] === "1" &&
       logs.compress !== "false";
     if (args !== target || fixLogs) {
-      if (process.argv[2] === "1") {
-        console.error("stop the running executor before migrating its Docker configuration");
-        process.exit(1);
-      }
       runtime.runtimeArgs = ["--network=none", "--ignore-cgroups"];
       if (fixLogs) logs.compress = "false";
       const temp = `${file}.${process.pid}.tmp`;
       fs.writeFileSync(temp, `${JSON.stringify(data, null, 2)}\n`, { flag: "wx", mode: 0o600 });
       fs.renameSync(temp, file);
     }
-  ' "$docker_config" "$service_running" ||
+  ' "$docker_config" ||
     fail 'fix the dedicated Docker configuration first'
 fi
 
 if [[ -n "$registry_mirror" ]]; then
-  ((service_running == 0)) || fail 'stop the running executor before changing its Docker registry mirror'
   as_runner "$node_bin" -e '
     const fs = require("node:fs");
     const path = process.argv[1];
@@ -301,9 +418,7 @@ if [[ ! -f "$runner_home/.config/systemd/user/docker.service" ]]; then
 fi
 as_runner systemctl --user daemon-reload
 as_runner systemctl --user enable docker.service
-if ((service_running == 0)); then
-  as_runner systemctl --user restart docker.service
-fi
+as_runner systemctl --user restart docker.service
 [[ "$(as_runner docker info --format '{{.CgroupVersion}}')" == 2 ]] ||
   fail 'rootless Docker is not using cgroup v2'
 [[ "$(as_runner docker info --format '{{.CgroupDriver}}')" == systemd ]] ||
@@ -320,40 +435,37 @@ if [[ -n "$registry_mirror" ]]; then
     fail 'rootless Docker did not load the configured registry mirror'
 fi
 
-if ((service_running == 1)); then
-  [[ -f "$runner_env" ]] || fail 'running executor has no runner.env'
-  as_runner docker image inspect qfli-terminal-sandbox:1 >/dev/null ||
-    fail 'running executor has no trusted sandbox image'
-  as_runner chmod 0600 "$runner_env"
-  as_runner systemctl --user enable qfli-terminal.service
-  step 'service already runs; checking health without changing its deployment'
-  as_runner "$node_bin" "$source_dir/deployment/check-health.mjs"
-  printf 'QFLI terminal setup: installed and enabled at boot\n'
-  exit 0
-fi
-
-if ! as_runner docker image inspect qfli-terminal-sandbox:1 >/dev/null 2>&1; then
+image_version=$(as_runner docker image inspect --format '{{index .Config.Labels "io.qfli.terminal.toolchains"}}' \
+  "$sandbox_image" 2>/dev/null || true)
+image_user=$(as_runner docker image inspect --format '{{.Config.User}}' "$sandbox_image" 2>/dev/null || true)
+image_source=$(as_runner docker image inspect --format '{{index .Config.Labels "io.qfli.terminal.sandbox-source"}}' \
+  "$sandbox_image" 2>/dev/null || true)
+sandbox_fingerprint=$(
+  cd "$source_dir"
+  find sandbox -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d " " -f1
+)
+if [[ "$image_version" != 2 || "$image_user" != 65533:65533 || \
+      "$image_source" != "$sandbox_fingerprint" ]]; then
   step 'building the trusted sandbox image; this can take several minutes'
+  if ! as_runner timeout 300 docker pull "$base_image"; then
+    [[ "$base_image" == debian:trixie-slim ]] || fail 'the selected trusted base image could not be pulled'
+    step 'Docker Hub unavailable; trying the Google Docker Hub mirror'
+    base_image=mirror.gcr.io/library/debian:trixie-slim
+    as_runner timeout 300 docker pull "$base_image" || fail 'both official Debian image registries are unreachable'
+  fi
   as_runner docker build --pull --progress=plain \
+    --label "io.qfli.terminal.sandbox-source=$sandbox_fingerprint" \
+    --build-arg "BASE_IMAGE=$base_image" \
     --build-arg "DEBIAN_MIRROR=$debian_mirror" \
-    -t qfli-terminal-sandbox:1 "$source_dir/sandbox" ||
+    -t "$sandbox_image" "$source_dir/sandbox" ||
     fail 'sandbox build failed; if Docker Hub is unreachable, rerun with --registry-mirror and your trusted HTTPS Docker Hub accelerator'
 fi
-
-step 'checking gVisor container startup under the bounded rootless account'
-as_runner docker run --rm --pull=never --runtime=runsc --network=none \
-  --log-driver=none --read-only --user=65532:65532 --cap-drop=ALL \
-  --security-opt=no-new-privileges --tmpfs=/workspace:rw,nosuid,nodev,size=256m,mode=0700,uid=65532,gid=65532 \
-  --tmpfs=/tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777 \
-  --entrypoint=/usr/bin/true qfli-terminal-sandbox:1 ||
-  fail 'gVisor startup under the dedicated rootless Docker daemon failed'
 
 step 'configuring the executor user service'
 config_dir="$runner_home/.config/qfli-terminal"
 as_runner install -d -m 0700 "$config_dir"
-if [[ ! -f "$runner_env" ]]; then
-  printf 'QFLI_TERMINAL_SECRET=%s\nQFLI_TERMINAL_IMAGE=qfli-terminal-sandbox:1\n' \
-    "$secret" | as_runner sh -c '
+printf 'QFLI_TERMINAL_SECRET=%s\nQFLI_TERMINAL_IMAGE=%s\n' \
+  "$secret" "$sandbox_image" | as_runner sh -c '
       set -eu
       temp_env=$(mktemp "$HOME/.config/qfli-terminal/runner.env.XXXXXXXX")
       trap "rm -f -- \"$temp_env\"" EXIT
@@ -361,9 +473,11 @@ if [[ ! -f "$runner_env" ]]; then
       chmod 0600 "$temp_env"
       mv -T -- "$temp_env" "$HOME/.config/qfli-terminal/runner.env"
     '
-fi
 as_runner chmod 0600 "$runner_env"
 unset secret
+step 'verifying all toolchains in actual bounded gVisor sessions'
+as_runner "$node_bin" --env-file="$runner_env" "$source_dir/deployment/verify-runtime.mjs" ||
+  fail 'runtime/toolchain verification failed; executor remains stopped'
 as_runner install -m 0644 \
   "$source_dir/deployment/qfli-terminal.service" \
   "$runner_home/.config/systemd/user/qfli-terminal.service"
@@ -374,10 +488,12 @@ step 'waiting for the authenticated local health check'
 for attempt in {1..10}; do
   if as_runner "$node_bin" "$source_dir/deployment/check-health.mjs" >/dev/null 2>&1; then
     as_runner "$node_bin" "$source_dir/deployment/check-health.mjs"
+    printf '%s\n' "$source_fingerprint" | as_runner sh -c 'umask 077; cat > "$1"' sh "$receipt"
     printf 'QFLI terminal setup: installed and enabled at boot\n'
     exit 0
   fi
   sleep 2
 done
 as_runner journalctl --user -u qfli-terminal.service -n 80 --no-pager || true
+as_runner systemctl --user disable --now qfli-terminal.service
 fail 'the executor did not become healthy; inspect the service log above'

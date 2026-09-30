@@ -1,8 +1,9 @@
 import { spawn } from 'node:child_process';
-import { readFile, lstat } from 'node:fs/promises';
+import { readFile, lstat, statfs } from 'node:fs/promises';
 import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import { ExecutorError, limits, log } from './config.js';
+import { toolchainVersion, sandboxTmpfs } from './sandbox.js';
 
 export function accountBudgetValid({ memory, swap, pids, cpu }) {
   const bounded = (value, max) => /^\d+$/.test(value.trim()) &&
@@ -147,8 +148,9 @@ export class Docker {
     const image = images[0];
     const expectedEntry = ['/usr/bin/python3', '-I', '/usr/local/lib/qfli/init.py'];
     if (images.length !== 1 || !/^sha256:[a-f0-9]{64}$/.test(image?.Id ?? '') ||
-        image.Config?.User !== '65532:65532' ||
+        image.Config?.User !== '65533:65533' ||
         image.Config?.Labels?.['io.qfli.terminal.image'] !== '1' ||
+        image.Config?.Labels?.['io.qfli.terminal.toolchains'] !== toolchainVersion ||
         Object.keys(image.Config?.Volumes ?? {}).length ||
         JSON.stringify(image.Config?.Entrypoint) !== JSON.stringify(expectedEntry) ||
         (image.Config?.Cmd?.length ?? 0) !== 0) throw new ExecutorError('sandbox_image_invalid');
@@ -156,9 +158,14 @@ export class Docker {
   }
 
   async validateAccountBudget() {
-    const base = `/sys/fs/cgroup/user.slice/user-${this.config.uid}.slice`;
-    const state = await lstat(base);
-    if (!state.isDirectory() || state.uid !== 0) throw new ExecutorError('account_cgroup_invalid');
+    const root = '/sys/fs/cgroup';
+    const base = `${root}/user.slice/user-${this.config.uid}.slice`;
+    const [state, rootState, filesystem] = await Promise.all([lstat(base), lstat(root), statfs(root)]);
+    // User-service filesystem protection maps host root to the overflow UID.
+    if (filesystem.type !== 0x63677270 || !rootState.isDirectory() ||
+        rootState.uid === this.config.uid || !state.isDirectory() || state.uid !== rootState.uid) {
+      throw new ExecutorError('account_cgroup_invalid');
+    }
     const [memory, swap, pids, cpu] = await Promise.all(
       ['memory.max', 'memory.swap.max', 'pids.max', 'cpu.max']
         .map(file => readFile(path.join(base, file), 'utf8')));
@@ -172,10 +179,6 @@ export class Docker {
     const container = values[0];
     if (container?.State?.OOMKilled) throw new ExecutorError('sandbox_resource_terminated', 409);
     const host = container?.HostConfig;
-    const expectedTmpfs = {
-      '/workspace': 'rw,nosuid,nodev,size=256m,mode=0700,uid=65532,gid=65532',
-      '/tmp': 'rw,nosuid,nodev,noexec,size=64m,mode=1777',
-    };
     const expectedUlimits = { nproc: 64, nofile: 256, core: 0 };
     if (values.length !== 1 || !container.State?.Running || container.Image !== imageId ||
         !Number.isSafeInteger(container.State.Pid) || container.State.Pid <= 0 ||
@@ -185,12 +188,12 @@ export class Docker {
         (host.GroupAdd?.length ?? 0) || host.PidMode !== '' || host.IpcMode !== 'private' ||
         host.UTSMode !== '' || host.LogConfig?.Type !== 'none' ||
         Object.keys(host.Tmpfs ?? {}).length !== 2 ||
-        Object.entries(expectedTmpfs).some(([key, value]) => host.Tmpfs?.[key] !== value) ||
+        Object.entries(sandboxTmpfs).some(([key, value]) => host.Tmpfs?.[key] !== value) ||
         host.Ulimits?.length !== 3 || Object.entries(expectedUlimits).some(([name, bound]) =>
           !host.Ulimits?.some(limit => limit.Name === name && limit.Soft === bound && limit.Hard === bound)) ||
         !host.CapDrop?.includes('ALL') || !host.SecurityOpt?.includes('no-new-privileges') ||
         host.SecurityOpt.some(item => item.startsWith('seccomp=')) ||
-        container.Config?.User !== '65532:65532' || container.Config?.Hostname !== 'sandbox' ||
+        container.Config?.User !== '65533:65533' || container.Config?.Hostname !== 'sandbox' ||
         container.Mounts?.some(mount => mount.Type !== 'tmpfs' || !['/workspace', '/tmp'].includes(mount.Destination))) {
       throw new ExecutorError('sandbox_configuration_invalid');
     }

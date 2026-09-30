@@ -3,6 +3,7 @@ import { mkdir, lstat, readdir, writeFile, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { Docker } from './docker.js';
 import { ExecutorError, limits, log } from './config.js';
+import { sandboxEnvArgs, sandboxTmpfs } from './sandbox.js';
 
 const owner = 'io.qfli.terminal.owner=qfli-terminal-v1';
 
@@ -91,13 +92,12 @@ export class Sessions {
       await this.management(record, ['create', '--name', record.name, '--rm', '--pull=never',
         '--label', owner, '--runtime', 'runsc', '--network', 'none', '--ipc', 'private',
         '--hostname', 'sandbox', '--read-only',
-        '--user', '65532:65532', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
+        '--user', '65533:65533', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
         '--shm-size', '1m',
         '--ulimit', 'nofile=256:256', '--ulimit', 'core=0:0', '--ulimit', 'nproc=64:64',
-        '--tmpfs', '/workspace:rw,nosuid,nodev,size=256m,mode=0700,uid=65532,gid=65532',
-        '--tmpfs', '/tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777',
-        '--workdir', '/workspace', '--env', 'HOME=/workspace', '--env', 'LANG=C.UTF-8',
-        '--env', 'PATH=/usr/local/bin:/usr/bin:/bin', '--log-driver', 'none', this.imageId]);
+        ...Object.entries(sandboxTmpfs).flatMap(([mount, flags]) => ['--tmpfs', `${mount}:${flags}`]),
+        '--workdir', '/workspace', ...sandboxEnvArgs,
+        '--log-driver', 'none', this.imageId]);
     } catch (error) {
       // A missing success response (including CLI EOF/nonzero exit) cannot prove
       // the daemon rejected create. Retain a restart-persistent recovery marker.
@@ -291,7 +291,7 @@ export class Sessions {
       await emit({ type: 'progress', stage: 'running' });
       deadline = setTimeout(() => record.controller.abort(), limits.commandMs);
       const operation = this.docker.run(['exec', '--user', '65532:65532', '--workdir', cwd,
-        '--env', 'HOME=/workspace', '--env', 'LANG=C.UTF-8', '--env', 'PATH=/usr/local/bin:/usr/bin:/bin',
+        ...sandboxEnvArgs,
         record.name, '/bin/sh', '-c', command], {
         signal: record.controller.signal, timeoutMs: limits.commandMs, outputBytes: limits.outputBytes,
         onOutput: emit,

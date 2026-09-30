@@ -62,14 +62,14 @@ def enforce_task_budget(deadline):
 
 def main():
     protect_process()
-    if os.getpid() != 1 or os.getuid() != 65532 or os.getgid() != 65532:
+    if os.getpid() != 1 or os.getuid() != 65533 or os.getgid() != 65533:
         raise SystemExit(70)
 
     signal.signal(signal.SIGTERM, terminate)
     signal.signal(signal.SIGINT, terminate)
     deadline = time.monotonic() + LEASE_SECONDS
     # The executor consumes this handshake before admitting any user process.
-    fd = os.open("/tmp/.qfli-init-ready", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    fd = os.open("/tmp/.qfli-init-ready", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
     with os.fdopen(fd, "wb") as marker:
         marker.write(b"ready\n")
     while not stopping and time.monotonic() < deadline:

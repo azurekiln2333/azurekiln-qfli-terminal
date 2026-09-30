@@ -1,4 +1,4 @@
-"""Consume the trusted init handshake before any user command is admitted."""
+"""Check the trusted init handshake before any user command is admitted."""
 
 import os
 import stat
@@ -21,11 +21,12 @@ def main():
             continue
         with os.fdopen(fd, "rb") as marker:
             metadata = os.fstat(marker.fileno())
-            if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 65532 or metadata.st_gid != 65532:
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 65533 or metadata.st_gid != 65533:
                 raise RuntimeError("unexpected readiness marker")
             content = marker.read(16)
         if content == b"ready\n":
-            os.unlink(MARKER)
+            # The supervisor owns this marker in sticky /tmp; users cannot alter it.
+            os.mkdir("/workspace/.tmp", 0o700)
             sys.stdout.write('{"ready":true}\n')
             sys.stdout.flush()
             return

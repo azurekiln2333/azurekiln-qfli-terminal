@@ -1,5 +1,6 @@
 import os from 'node:os';
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { sandboxImage } from './sandbox.js';
 
 export const requestContext = new AsyncLocalStorage();
 
@@ -34,7 +35,7 @@ export function configuration() {
       (process.env.XDG_RUNTIME_DIR && process.env.XDG_RUNTIME_DIR !== runtimeDir)) {
     throw new Error('executor_requires_local_rootless_socket');
   }
-  const image = process.env.QFLI_TERMINAL_IMAGE || 'qfli-terminal-sandbox:1';
+  const image = process.env.QFLI_TERMINAL_IMAGE || sandboxImage;
   if (!/^[a-z0-9][a-z0-9._/:@-]{0,250}$/.test(image)) throw new Error('executor_image_invalid');
   return {
     secret,

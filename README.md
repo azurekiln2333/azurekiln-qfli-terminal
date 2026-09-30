@@ -1,5 +1,7 @@
 # QFLI 云端终端隔离服务
 
+Ubuntu 24.04 与 AL3 / systemd 239 已在独立 WSL 环境通过十种语言、隔离和生命周期测试。生产 ECS 内核尚未验证，AL3 内存压力下的清理超时与 OOM 自动恢复仍是验收缺口，当前不建议公开部署；完整证据见 [runtime-validation.md](docs/runtime-validation.md)。
+
 ## 架构与边界
 
 ```text
@@ -17,20 +19,21 @@ App -> QFLI 业务 API -> 127.0.0.1:3101 执行服务
 
 执行机须为 x86_64、cgroup v2，且能运行带 `--ignore-cgroups` 的 gVisor。Alibaba Cloud Linux 3.2104 的 systemd 239 不支持 gVisor 自行创建 systemd cgroup，因此安装器改为让 gVisor 使用执行账号已有的受限 cgroup；不要求更换服务器或重装系统。Docker daemon 仍为 `qfli-runner` 账号的 rootless 服务。容器不声明虚假的独立 CPU/内存限额，执行服务会核对宿主上的实际账号限额及沙箱进程归属；核对失败就不开放终端。
 
-先在执行机上运行 `systemctl --version | head -1` 和 `stat -fc %T /sys/fs/cgroup`；Alibaba Cloud Linux 3.2104 的 systemd 239 可用，但 cgroup 必须是 `cgroup2fs`。安装器会在下载前检查系统和 cgroup 模式。全新 Ubuntu 24.04 还需准备专用账号、Docker Engine/CLI/rootless extras、从属 UID/GID 和 rootless Docker 前置条件，见下文“Linux 部署步骤”。
+先在执行机上运行 `systemctl --version | head -1` 和 `stat -fc %T /sys/fs/cgroup`；兼容路径支持 systemd 239 起的用户 slice 接口，cgroup 必须是 `cgroup2fs`。安装器在下载前检查系统和 cgroup 模式，按需准备专用账号、从属 UID/GID、Docker Engine/CLI/rootless extras 和系统依赖。实际兼容性以本文件开头的验收记录为准。
 
-执行机具备上述条件后，把**整个新版** `azurekiln-qfli-terminal` 目录同步到 `/home/qfli-runner/azurekiln-qfli-terminal`。本地生成的 ZIP 不会自动出现在服务器的 `/root`；须先上传到执行机，再解压到执行账号的家目录。`unzip` 报找不到 ZIP 后，继续运行服务器上旧的安装器只会重复旧流程。从可信的上传目录将**新版**安装器复制到仅 root 可写的位置，然后在执行机的 root 终端运行：
+从可信的上传目录将**新版**安装器复制到仅 root 可写的位置。`--source-dir` 指向完整源码目录，安装器会将源码安装到执行账号的家目录；首次安装无需预先创建账号。以下是安装器入口，开放终端前仍须完成验收记录：
 
 ```sh
 install -o root -g root -m 0700 \
-  /home/qfli-runner/azurekiln-qfli-terminal/deployment/bootstrap.sh \
+  /实际上传目录/azurekiln-qfli-terminal/deployment/bootstrap.sh \
   /root/qfli-terminal-bootstrap.sh
-bash /root/qfli-terminal-bootstrap.sh
+bash /root/qfli-terminal-bootstrap.sh \
+  --source-dir /实际上传目录/azurekiln-qfli-terminal
 ```
 
 脚本会隐藏输入**业务后端已经使用的** 64 位十六进制终端密钥；不能在聊天或日志中粘贴密钥。已知业务 `.env` 路径时，也可运行 `bash /root/qfli-terminal-bootstrap.sh --business-env /实际业务后端目录/.env`，脚本只读取其中的 `QFLI_TERMINAL_SECRET`，不会复制业务配置到执行账号。若业务后端尚未配置终端密钥，先按下文“连接业务后端”配置两端相同的独立密钥。安装器不会替你修改或重启业务服务。
 
-脚本会优先从系统或宝塔已安装的 Node.js 22.9+ 复制一份到 `/usr/local/bin/qfli-node`；没有可用版本时从 Node.js 官网下载最新的 24.x Linux x64 包并校验 SHA-256。它还会校验 gVisor 下载、设置执行账号整体限额、配置专用 rootless Docker、构建沙箱镜像、写入专用密钥文件、安装终端用户服务，并以带认证的 `/health` 检查结果。下载和首次镜像构建可能需要几分钟；失败后修复报错并重新运行同一命令。服务已在运行时重跑只核对配置和健康状态，不重启正在运行的 Docker 或终端。安装器面向 Alibaba Cloud Linux 3 和 Ubuntu 24.04 的 cgroup v2 环境。
+脚本会优先从系统或宝塔已安装的 Node.js 22.9+ 复制一份到 `/usr/local/bin/qfli-node`；没有可用版本时从 Node.js 官网下载最新的 24.x Linux x64 包并校验 SHA-256。它还会校验 gVisor 下载、设置执行账号整体限额、配置专用 rootless Docker、构建沙箱镜像并写入专用密钥文件。随后用真实 Sessions 逐个编译/运行语言，验证隔离、快照、后台清理、重置、输出上限和命令超时，通过后才安装并启用终端服务，检查带认证的 `/health`。下载和首次镜像构建可能需要几分钟；已验收的同一源码版本在运行时重跑只检查健康，不重启 Docker 或终端。源码变化会停止旧终端、更新并重新验收；失败时保持终端禁用。
 
 在受支持的执行机升级旧版终端服务时，若服务因 Docker 启动失败而每 5 秒重启，先以 root 停止该专用用户服务，再上传新版目录并重新复制、运行安装器。安装器会迁移旧的 `runsc --rootless=true` 与单文件日志压缩设置，重启执行账号的 Docker，并先做一个无网络的 gVisor 容器启动检查；检查不通过时不会启动终端服务。
 
@@ -41,7 +44,7 @@ runuser -u qfli-runner -- env XDG_RUNTIME_DIR=/run/user/$runner_uid \
   systemctl --user stop qfli-terminal.service
 ```
 
-如果构建在 `FROM debian:bookworm-slim` 阶段报 `registry-1.docker.io:443` 连接失败，需为**执行账号的 rootless Docker** 提供可信的 Docker Hub 镜像加速地址。可以从阿里云容器镜像服务控制台获取当前账号的 HTTPS 加速地址，然后重新执行 `bash /root/qfli-terminal-bootstrap.sh --registry-mirror https://你的加速地址`。脚本会把地址写入 `/home/qfli-runner/.config/docker/daemon.json`，保留已有 `runsc` 设置并重启该账号的 Docker；不会修改宿主 root Docker。不要填未核验的公共代理地址，也不要关闭 TLS 校验。`--debian-mirror` 仅用于基础镜像**内部**的 apt 下载，不能解决 Docker Hub 基础镜像拉取失败。
+Docker Hub 拉取 Debian 基础镜像失败时，安装器自动尝试 Google 官方的 `mirror.gcr.io/library/debian:trixie-slim` 缓存源。管理员也可通过 `--registry-mirror` 使用可信 HTTPS Docker Hub 加速地址，或通过 `--base-image` 选择已审核的基础镜像。镜像加速配置只写入执行账号的 rootless Docker，保留 `runsc`；不会修改宿主 root Docker 配置。禁止关闭 TLS 校验。`--debian-mirror` 仅用于镜像内部的 apt 下载；Dockerfile 先用 Debian 默认签名源安装 CA，再切换镜像站，避免 HTTP 转 HTTPS 时缺少 CA。
 
 **开机无需再次运行脚本。** 安装器设置 `loginctl enable-linger qfli-runner`，并启用该账号的 `docker.service` 与 `qfli-terminal.service`；systemd 在服务器重启后自动启动它们。首次安装成功后仍须确认业务后端使用相同的密钥。仅同机部署才可使用 `QFLI_TERMINAL_URL=http://127.0.0.1:3101`；独立执行机需要受来源限制、证书有效的内部 HTTPS 入口，然后把业务后端的 URL 指向该入口。重启业务服务并做下文的 Linux 上线验收。以下分步命令保留用于排障和手工维护。
 
@@ -61,9 +64,23 @@ runuser -u qfli-runner -- env XDG_RUNTIME_DIR=/run/user/$runner_uid \
 | 执行账号整体 | MemoryHigh 768 MiB、MemoryMax 1 GiB、TasksMax 1024；启动和每次命令前检查 |
 | 外网 | 完全关闭，包括下载包、SSH 与 Git 远程操作 |
 
-根文件系统只读，运行用户固定 `65532:65532`，所有 capabilities 被移除，启用 `no-new-privileges` 和默认 seccomp。不挂载宿主目录、设备、卷或 Docker socket，不共享宿主 PID/网络命名空间。`/workspace` 可以执行用户编译的程序，挂载仍带 `nosuid,nodev`；`/tmp` 另带 `noexec`。
+根文件系统只读，用户命令为 `65532:65532`，监督进程为独立非 root 身份 `65533:65533`，所有 capabilities 被移除，启用 `no-new-privileges` 和默认 seccomp。不挂载宿主目录、设备、卷或 Docker socket，不共享宿主 PID/网络命名空间。`/workspace` 显式带 `exec`，允许执行用户编译的程序，并保留 `nosuid,nodev`；`/tmp` 另带 `noexec`。
 
-镜像内固定提供 Python 3、Node.js、GCC/G++、Make、Git、Lua 5.4、OpenJDK 17。镜像由管理员构建；用户不能在会话内安装系统包。内存和存储限额会限制大型编译或 JVM，程序可能失败或被终止。
+镜像基于 Debian trixie，提供下列工具链；Node.js 和 Dart 官方下载包固定版本与 SHA-256，其他工具使用 Debian 已签名的软件包。
+
+| 语言 | 工具 |
+| --- | --- |
+| C / C++ | GCC / G++、Make、CMake、pkg-config |
+| Java | OpenJDK 21（java / javac）、Maven |
+| Lua | Lua 5.4、LuaRocks |
+| Node.js | Node.js 24.15.0、npm |
+| Python | Python 3、pip、venv |
+| PHP | PHP CLI、Composer |
+| Go | Go 编译器与标准库 |
+| Rust | rustc、Cargo |
+| Dart | Dart SDK 3.13.5、JIT 运行与原生可执行文件编译 |
+
+工作区 `.tmp` 由就绪检查创建，用于需要可执行临时文件的编译器。Java 默认最大堆为 256 MiB、识别 1 个处理器；Go 和 Cargo 默认单路构建，适配账号整体预算。镜像由管理员构建；用户不能在会话内安装系统包。外网关闭，包管理器可运行本地项目和已有依赖，但不能下载 Maven / npm / pip / Composer / Cargo / pub 的远程依赖。内存、存储和时间限额会限制大型构建，程序可能失败或被终止。
 
 默认预算面向 2 核 / 2 GiB 小服务器：唯一沙箱与 rootless Docker、gVisor、执行 Node 共用账号的 1 核 / 1 GiB 硬上限。达到上限会造成 OOM 或终端服务不可用；OS、业务 Node、数据库和宝塔还需共用剩余资源。编译大型项目可能超出预算，不能仅因镜像包含编译器就承诺任意项目都能构建。
 
@@ -85,7 +102,7 @@ runuser -u qfli-runner -- env XDG_RUNTIME_DIR=/run/user/$runner_uid \
 
 gVisor 的宿主线程和用户看到的进程不是一一对应关系，所以账号级 `pids.max` 约束总宿主任务数，容器 `nproc=64:64` 与 PID 1 每约 50 毫秒检查用户可见进程/线程总数。轮询不能保证瞬时数量绝不越界；目标 gVisor 版本的 guest `nproc` 行为必须在 Linux 上验收，不能只看账号 cgroup 值就宣称用户进程限制已验证。
 
-PID 1 首先调用 `PR_SET_DUMPABLE=0` 并验证成功，安装信号处理后才写出一次性的启动就绪标记。受信 `ready.py` 在第一条用户命令前读取并删除该标记；后续不会信任用户可写的 `/tmp` 中的任何就绪文件。清理进程使用 `65532:65534`，用户命令为 `65532:65532`，通过不同 GID 阻止用户在清理进程启动瞬间使用 ptrace、`/proc/<pid>/mem` 或 `process_vm_writev` 修改它；清理进程还独立启用不可转储保护。保护不可用、就绪失败或 helper 身份不符都停止该会话。
+PID 1 使用 `65533:65533`，先调用 `PR_SET_DUMPABLE=0` 并验证成功，安装信号处理后写出该 UID 拥有的就绪标记。不同 UID 阻止用户暂停监督进程；仅设置不可转储不能阻止同 UID 的 `SIGSTOP`。受信 `ready.py` 在第一条用户命令前核对标记并创建编译器临时目录；标记留在 sticky `/tmp` 中，用户不能修改或删除，后续不再用于就绪判断。清理进程使用 `65532:65534`，用户命令为 `65532:65532`，通过不同 GID 阻止用户在清理进程启动瞬间使用 ptrace、`/proc/<pid>/mem` 或 `process_vm_writev` 修改它；清理进程还独立启用不可转储保护。保护不可用、就绪失败或 helper 身份不符都停止该会话。
 
 ## 先处理旧实例
 
@@ -140,8 +157,10 @@ dnf install -y zstd
 install -d -m 0700 /root/qfli-gvisor-download
 cd /root/qfli-gvisor-download
 gvisor_release="https://storage.googleapis.com/gvisor/releases/release/latest/$(uname -m)"
-curl --fail --location --retry 3 --output gvisor.tar.zstd "$gvisor_release/gvisor.tar.zstd"
-curl --fail --location --retry 3 --output gvisor.tar.zstd.sha512 "$gvisor_release/gvisor.tar.zstd.sha512"
+curl --fail --location --ipv4 --tls-max 1.2 --retry 3 --retry-max-time 900 \
+  --connect-timeout 15 --max-time 600 --output gvisor.tar.zstd "$gvisor_release/gvisor.tar.zstd"
+curl --fail --location --ipv4 --tls-max 1.2 --retry 3 --retry-max-time 90 \
+  --connect-timeout 15 --max-time 60 --output gvisor.tar.zstd.sha512 "$gvisor_release/gvisor.tar.zstd.sha512"
 set -o pipefail
 sha512sum -c gvisor.tar.zstd.sha512 && \
   zstd -dc gvisor.tar.zstd | tar -xf - -C /usr/local/bin
@@ -168,7 +187,7 @@ systemctl show "user-$runner_uid.slice" \
   -p CPUQuotaPerSecUSec -p MemoryMax -p MemorySwapMax -p TasksMax
 ```
 
-整个账号限制 1 核、1 GiB、无 swap、1024 tasks，覆盖 Docker daemon、gVisor、Node 与所有用户会话。两个会话内存最多 512 MiB，剩余预算留给隔离运行时与管理进程；实际开销可能导致账号先到达总上限。2 GiB 同机部署须监控账号用量、宿主剩余内存和业务数据库用量，大型 Java/C++ 编译容易触发限制。只配置专用执行账号的 slice。
+整个账号限制 1 核、1 GiB、无 swap、1024 tasks，覆盖 Docker daemon、gVisor、Node 与唯一用户会话。没有独立的每容器内存配额；实际总开销可能使账号到达上限。2 GiB 同机部署须监控账号用量、宿主剩余内存和业务数据库用量，大型编译容易触发限制。只配置专用执行账号的 slice。
 
 ### 3. 安装专用 rootless Docker
 
@@ -202,27 +221,27 @@ docker info
 
 ```sh
 cd "$HOME/azurekiln-qfli-terminal"
-docker build --pull -t qfli-terminal-sandbox:1 sandbox
-docker image inspect qfli-terminal-sandbox:1
+docker build --pull -t qfli-terminal-sandbox:2 sandbox
+docker image inspect qfli-terminal-sandbox:2
 ```
 
 `docker image inspect` 若返回 `No such image`，表示镜像尚未构建；Docker socket 存在不代表沙箱镜像存在。构建、检查及后续执行服务必须使用同一个 `qfli-runner` rootless Docker socket。
 
-如果目标服务器无法访问 Docker Hub，也没有可用的可信镜像加速地址，可在另一台受信、同为 Linux x86_64 的机器按本项目 Dockerfile 构建完整的 `qfli-terminal-sandbox:1` 镜像，通过 `docker save` 导出并校验传输文件，再在目标服务器的 **`qfli-runner` rootless Docker** 中 `docker load`。安装器检测到完整镜像后会跳过目标机的构建，启动时仍会检查镜像标签、用户、入口点和运行时隔离条件。不要只把基础镜像导入后重试默认构建，因为默认 `--pull` 仍会连接 Docker Hub。
+如果目标服务器无法访问 Docker Hub，也没有可用的可信镜像加速地址，可在另一台受信、同为 Linux x86_64 的机器按本项目 Dockerfile 构建完整的 `qfli-terminal-sandbox:2` 镜像，通过 `docker save` 导出并校验传输文件，再在目标服务器的 **`qfli-runner` rootless Docker** 中 `docker load`。安装器仍须在真实会话中验证全部工具链、镜像用户、入口点和运行时隔离条件。旧 `:1` 镜像不满足工具链版本要求。不要只把基础镜像导入后重试默认构建，因为默认 `--pull` 仍会连接 Docker Hub。
 
 如果构建长期停在 `apt-get install` 的 `Get:` 下载行（例如 Debian 包下载已经 5500 秒），耗时在镜像构建的网络下载阶段，尚未开始用户沙箱初始化。用 Ctrl-C 停止这次构建，核对服务器到可信镜像站的连通性后重新构建：
 
 ```sh
 docker build --pull --progress=plain \
   --build-arg DEBIAN_MIRROR=http://mirrors.tuna.tsinghua.edu.cn \
-  -t qfli-terminal-sandbox:1 sandbox
+  -t qfli-terminal-sandbox:2 sandbox
 ```
 
-`DEBIAN_MIRROR` 填镜像站主地址，不额外带 `/debian`；Dockerfile 同时保留 Debian 主源与安全源路径，apt 签名校验仍开启。这里用 HTTP 引导下载，因为 `bookworm-slim` 在安装 `ca-certificates` 前可能没有 CA 信任库；仅在可信基础镜像已带有效 CA 时改用 HTTPS，禁止设置 `Verify-Peer=false`。下载连接/无数据超时为 30 秒、重试最多 2 次，并使用 IPv4；这不是整层构建的 30 秒总截止，下载吞吐持续很低时应换可信镜像源。不要使用 `trusted=yes` 或关闭签名校验。镜像构建仅由管理员执行，构建本身也消耗磁盘、CPU 和内存；小服务器可在受信构建机器生成镜像后导入。首次部署继续下面的 unit 安装步骤；已有服务升级镜像后，才运行 `systemctl --user restart qfli-terminal.service` 并查看其日志。
+`DEBIAN_MIRROR` 填镜像站主地址，不额外带 `/debian`；Dockerfile 同时保留 Debian 主源与安全源路径，apt 签名校验仍开启。CA 由 Debian 默认签名源引导安装，之后允许镜像站跳转到 HTTPS；禁止设置 `Verify-Peer=false`。软件索引有任一下载失败时终止构建。下载连接/无数据超时为 30 秒、重试最多 2 次，并使用 IPv4；这不是整层构建的 30 秒总截止，下载吞吐持续很低时应换可信镜像源。不要使用 `trusted=yes` 或关闭签名校验。Node 和 Dart 下载使用 TLS 1.2、重试及备用源，备用文件仍必须通过官方固定 SHA-256 校验。构建层按 CA、系统工具、Node、Dart 分开缓存。
 
-生产升级建议固定经过审核的 Debian 基础镜像 digest：使用 `--build-arg BASE_IMAGE=debian:bookworm-slim@sha256:<审核后的digest>`。构建只允许管理员触发，不提供镜像名、Dockerfile 或挂载参数的用户输入。执行服务启动后将标签解析成不可变 image ID，每个会话都使用该 ID；更新镜像必须重启执行服务并重新通过检测。
+生产升级建议固定经过审核的 Debian 基础镜像 digest：使用 `--build-arg BASE_IMAGE=debian:trixie-slim@sha256:<审核后的digest>`。构建只允许管理员触发，不提供镜像名、Dockerfile 或挂载参数的用户输入。执行服务启动后将标签解析成不可变 image ID，每个会话都使用该 ID；更新镜像必须重启执行服务并重新通过检测。
 
-镜像必须含 `io.qfli.terminal.image=1` 标签，用户 `65532:65532`，精确 entrypoint `[/usr/bin/python3,-I,/usr/local/lib/qfli/init.py]`，且没有声明 volumes。不要复用包含业务密钥的镜像。
+镜像必须含 `io.qfli.terminal.image=1` 与 `io.qfli.terminal.toolchains=2` 标签，监督用户 `65533:65533`，精确 entrypoint `[/usr/bin/python3,-I,/usr/local/lib/qfli/init.py]`，且没有声明 volumes。安装器用 `io.qfli.terminal.sandbox-source` 记录沙箱源码指纹，不匹配时重建；手工加载的镜像也需要匹配当前源码。不要复用包含业务密钥的镜像。
 
 ### 5. 配置并启动执行服务
 
@@ -239,7 +258,7 @@ ${EDITOR:-vi} "$HOME/.config/qfli-terminal/runner.env"
 
 ```dotenv
 QFLI_TERMINAL_SECRET=这里填写生成的64位十六进制密钥
-QFLI_TERMINAL_IMAGE=qfli-terminal-sandbox:1
+QFLI_TERMINAL_IMAGE=qfli-terminal-sandbox:2
 ```
 
 文件权限为 `0600`。将 `deployment/qfli-terminal.service` 安装到 `$HOME/.config/systemd/user/qfli-terminal.service`，运行：
@@ -248,6 +267,7 @@ QFLI_TERMINAL_IMAGE=qfli-terminal-sandbox:1
 mkdir -p "$HOME/.config/systemd/user"
 install -m 0644 deployment/qfli-terminal.service "$HOME/.config/systemd/user/qfli-terminal.service"
 chmod 0600 "$HOME/.config/qfli-terminal/runner.env"
+/usr/local/bin/qfli-node --env-file="$HOME/.config/qfli-terminal/runner.env" deployment/verify-runtime.mjs
 systemctl --user daemon-reload
 systemctl --user enable --now qfli-terminal.service
 systemctl --user status qfli-terminal.service
@@ -291,7 +311,7 @@ QFLI_TERMINAL_SECRET=与runner.env相同的独立内部密钥
 | Docker 列出 `runsc`，但 `/usr/local/bin/runsc` 不存在 | 仅注册了运行时名称；按上文安装完整 gVisor 包并重启专用 Docker。 |
 | `CgroupVersion=1` 或 `/sys/fs/cgroup` 为 `tmpfs` | 宿主仍为 cgroup v1；执行服务不能在此状态启动，需先启用 cgroup v2 并重启宿主。 |
 | `systemd version 239 not supported` | 服务器仍在运行旧的 `runsc` 参数；停止旧服务，上传新版目录，重跑安装器迁移 rootless Docker 配置并检查账号限额。 |
-| `No such image: qfli-terminal-sandbox:1` | 以 `qfli-runner` 构建镜像，确认使用同一个 rootless Docker socket。 |
+| `No such image: qfli-terminal-sandbox:2` | 以 `qfli-runner` 构建新版镜像，确认使用同一个 rootless Docker socket。 |
 | `Rootless mode not supported with "create"` | 旧配置给 `runsc` 传了 `--rootless=true`；停止重启中的终端服务，上传新版目录并重跑安装器迁移专用 Docker 配置。 |
 | `compression cannot be enabled when max file count is 1` | 专用 Docker 的 `local` 日志驱动需配置 `"compress":"false"`；新版安装器会迁移旧配置。 |
 | 携带内部密钥访问 `/health` 返回 401 / 503 | 分别检查两端内部密钥是否一致 / 执行服务初始化日志和隔离前置条件。 |
@@ -308,10 +328,10 @@ QFLI_TERMINAL_SECRET=与runner.env相同的独立内部密钥
 
 ## 上线验收与故障恢复
 
-本仓库只做了静态检查，当前 Windows 开发环境没有 Docker，尚未完成 Linux 下真实 gVisor 运行验证。公开入口开放前，管理员必须在目标机器确认：
+实际运行证据与宿主范围见 [验收记录](docs/runtime-validation.md)。WSL 下的验证不能代替生产 ECS 内核、网络及业务转发验收。公开入口开放前，管理员必须在目标机器确认：
 
 1. 启动检查成功，日志确认 Linux/rootless/cgroup v2/seccomp/runsc、可信 image ID、单会话容量和账号级实际 cgroup 限额。
-2. 沙箱 inspect 中 rootfs 只读、无 privileged/host namespaces/宿主 mounts、network none、capabilities 全移除、uid 65532；`/proc/<沙箱 PID>/cgroup` 必须落在 `user-<UID>.slice` 下，账号实际 `cpu.max` 不超过 1 核、`memory.max` 不超过 1 GiB、`memory.swap.max` 为 0、`pids.max` 不超过 1024。磁盘由 tmpfs 实际大小限制。
+2. 沙箱 inspect 中 rootfs 只读、无 privileged/host namespaces/宿主 mounts、network none、capabilities 全移除，监督进程为 uid 65533、用户命令为 uid 65532；`/proc/<沙箱 PID>/cgroup` 必须落在 `user-<UID>.slice` 下，账号实际 `cpu.max` 不超过 1 核、`memory.max` 不超过 1 GiB、`memory.swap.max` 为 0、`pids.max` 不超过 1024。磁盘由 tmpfs 实际大小限制。
 3. 普通命令可运行；后台进程不能跨命令存活；区分并验证账号宿主 `pids.max` 与 guest `nproc=64:64`，包括进程/线程风暴和 PID 1 兜底退出；输出超额、命令超时、客户端断开、进程超额或被观察到的 OOM 后会话被销毁；服务启动时清理带专用所有权标签的遗留容器。
 4. 用户无法联网、读取宿主业务目录或获取业务环境变量；多个用户的工作区互不访问；重置会丢失会话文件，云项目文件不受影响。
 5. 验证单执行槽、1 份会话容量、FIFO 8 条等待/20 秒期限及每用户互斥；创建/执行后清理仍占执行槽，等待不预留沙箱。验证位置更新、等待超时、断开、重置及关闭移除等待项。会话已满或队列已满分别拒绝；Docker 故障或删除失败时进入不可执行状态，不把未清理资源视为已释放。
