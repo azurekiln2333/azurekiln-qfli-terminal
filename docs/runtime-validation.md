@@ -27,6 +27,29 @@ Existing systems, including `qfli-java-build`, were not changed.
 
 ## Acceptance Evidence
 
+### Upgrade preflight regression (2026-10-01)
+
+`test/bootstrap-upgrade.sh` passed on `qfli-terminal-al3-clean` (AL3/systemd
+239, runner UID 3000, Docker 26.1.3). It ran the actual root-owned bootstrap
+while the existing Docker and executor services were healthy and enabled.
+Writable root-owned docs, a nested root-owned file, a runner-owned read-only
+file, a destination symlink, and missing docs/test release sources all failed
+before stopping the executor. Both service PIDs, start timestamps, active and
+enabled states stayed unchanged, as did the runner env file.
+
+After fixture repair, upgrade overwrote stale README and runtime documentation,
+preserved runner credentials, and passed all ten language checks plus isolation,
+background cleanup, reset, output bound and command timeout checks. A repeat
+install retained both service PIDs/timestamps. This remains isolated WSL
+evidence, not remote verification of the production filesystem or ECS kernel.
+To repeat on a disposable installed host, run as root:
+
+```sh
+QFLI_TERMINAL_TEST_HOST=1 bash test/bootstrap-upgrade.sh SOURCE_DIR BUSINESS_ENV
+```
+
+### Existing runtime acceptance
+
 | Check | Ubuntu 24.04 | Alibaba Cloud Linux 3 / systemd 239 |
 | --- | --- | --- |
 | Fresh bootstrap prepares account and rootless prerequisites | Passed | Passed on fresh UID 3000 fixture |

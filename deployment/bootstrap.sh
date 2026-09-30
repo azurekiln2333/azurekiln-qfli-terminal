@@ -13,7 +13,9 @@ input_source=''
 sandbox_image=qfli-terminal-sandbox:2
 download_dir=''
 node_download_dir=''
+release_stage_dir=''
 node_bin=/usr/local/bin/qfli-node
+release_entries=(src sandbox deployment test docs package.json README.md .env.example)
 
 usage() {
   printf '%s\n' \
@@ -39,6 +41,10 @@ cleanup() {
   fi
   if [[ "$node_download_dir" == /var/tmp/qfli-node.* ]]; then
     rm -rf -- "$node_download_dir"
+  fi
+  if [[ "$release_stage_dir" == /var/tmp/qfli-release.* ]]; then
+    rm -f -- "$release_stage_dir/release.tar"
+    rmdir -- "$release_stage_dir" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
@@ -238,15 +244,19 @@ runner_home=$(getent passwd "$runner" | cut -d: -f6)
 source_dir="$runner_home/azurekiln-qfli-terminal"
 if [[ -n "$input_source" ]]; then
   input_source=$(realpath -- "$input_source")
-  [[ -f "$input_source/src/server.js" && -f "$input_source/sandbox/smoke-languages.sh" && \
-     -f "$input_source/deployment/verify-runtime.mjs" ]] || fail 'source directory is incomplete'
 fi
 release_source=${input_source:-$source_dir}
-[[ -f "$release_source/src/server.js" && -f "$release_source/deployment/qfli-terminal.service" && \
-   -f "$release_source/deployment/check-health.mjs" && \
-   -f "$release_source/deployment/verify-runtime.mjs" && -f "$release_source/sandbox/smoke-languages.sh" && \
-   -f "$release_source/deployment/docker-daemon.json" && -f "$release_source/sandbox/Dockerfile" ]] ||
-  fail "install the current source at $source_dir before running this script"
+for entry in "${release_entries[@]}"; do
+  [[ -e "$release_source/$entry" ]] || fail "source directory is incomplete: missing $release_source/$entry"
+done
+for entry in src sandbox deployment test docs; do
+  [[ -d "$release_source/$entry" ]] || fail "release entry must be a directory: $release_source/$entry"
+done
+for entry in package.json README.md .env.example src/server.js deployment/qfli-terminal.service \
+  deployment/check-health.mjs deployment/verify-runtime.mjs sandbox/smoke-languages.sh \
+  deployment/docker-daemon.json sandbox/Dockerfile; do
+  [[ -f "$release_source/$entry" ]] || fail "release entry must be a file: $release_source/$entry"
+done
 
 as_runner() {
   runuser -u "$runner" -- env -i HOME="$runner_home" USER="$runner" LOGNAME="$runner" \
@@ -287,12 +297,43 @@ fi
   fail 'the installer requires the recommended 64-character hexadecimal shared secret'
 unset business_secret
 
+if [[ "$release_source" != "$source_dir" ]]; then
+  step 'checking release overwrite permissions before stopping the executor'
+  [[ ! -L "$source_dir" ]] || fail "release directory must not be a symlink: $source_dir"
+  if [[ -e "$source_dir" ]]; then
+    [[ -d "$source_dir" ]] || fail "release destination must be a directory: $source_dir"
+    as_runner test -O "$source_dir" && as_runner test -w "$source_dir" && \
+      as_runner test -x "$source_dir" ||
+      fail "release directory must be owned and writable by $runner: $source_dir; repair its ownership/permissions and rerun"
+    for entry in "${release_entries[@]}"; do
+      target="$source_dir/$entry"
+      [[ -e "$target" || -L "$target" ]] || continue
+      if [[ -d "$release_source/$entry" ]]; then
+        [[ -d "$target" && ! -L "$target" ]] || fail "release destination must be a directory: $target"
+      else
+        [[ -f "$target" && ! -L "$target" ]] || fail "release destination must be a regular file: $target"
+      fi
+      # Tar changes directory metadata too, even when a root-owned path is writable.
+      blocked=$(as_runner find "$target" -xdev \
+        \( -type l -o ! -uid "$runner_uid" -o ! -writable -o \( -type d ! -executable \) \) \
+        -print -quit) || fail "cannot inspect release destination as $runner: $target"
+      [[ -z "$blocked" ]] ||
+        fail "release overwrite blocked at $blocked; managed paths must be owned/writable by $runner, directories traversable, and symlinks absent; repair and rerun"
+    done
+  else
+    as_runner install -d -m 0755 "$source_dir" || fail "cannot create release destination as $runner: $source_dir"
+  fi
+  release_stage_dir=$(mktemp -d /var/tmp/qfli-release.XXXXXXXX)
+  tar -C "$release_source" -cf "$release_stage_dir/release.tar" "${release_entries[@]}" ||
+    fail 'cannot archive the complete release; executor has not been stopped'
+fi
+
 step 'starting the dedicated user manager'
 loginctl enable-linger "$runner"
 systemctl start "user@$runner_uid.service"
 source_fingerprint=$(
   cd "$release_source"
-  find src sandbox deployment -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d " " -f1
+  find "${release_entries[@]}" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d " " -f1
 )
 receipt="$runner_home/.config/qfli-terminal/validated-source.sha256"
 if as_runner systemctl --user is-active --quiet qfli-terminal.service; then
@@ -314,8 +355,7 @@ if as_runner systemctl --user cat qfli-terminal.service >/dev/null 2>&1; then
   as_runner systemctl --user disable --now qfli-terminal.service
 fi
 if [[ "$release_source" != "$source_dir" ]]; then
-  as_runner install -d -m 0755 "$source_dir"
-  tar -C "$release_source" -cf - src sandbox deployment test docs package.json README.md .env.example | \
+  cat "$release_stage_dir/release.tar" | \
     as_runner tar -C "$source_dir" --no-same-owner -xf -
 fi
 

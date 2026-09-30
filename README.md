@@ -33,6 +33,17 @@ bash /root/qfli-terminal-bootstrap.sh \
 
 脚本会隐藏输入**业务后端已经使用的** 64 位十六进制终端密钥；不能在聊天或日志中粘贴密钥。已知业务 `.env` 路径时，也可运行 `bash /root/qfli-terminal-bootstrap.sh --business-env /实际业务后端目录/.env`，脚本只读取其中的 `QFLI_TERMINAL_SECRET`，不会复制业务配置到执行账号。若业务后端尚未配置终端密钥，先按下文“连接业务后端”配置两端相同的独立密钥。安装器不会替你修改或重启业务服务。
 
+升级会覆盖发布清单中的 `src`、`sandbox`、`deployment`、`test`、`docs`、`package.json`、`README.md` 和 `.env.example`，不跳过旧文件；独立配置目录中的密钥和业务数据不在复制清单中。安装器在停止旧服务前检查完整清单、目标路径类型、执行账号归属、写入与目录访问权限，并提前生成待复制的归档。预检失败会指出具体路径，保留旧服务的运行与启用状态。源码指纹包含整个发布清单。
+
+如果之前以 root 把源码解压到执行账号家目录，`tar: Cannot open: File exists`、`Cannot utime` 或 `Cannot change mode` 可能表示旧文件/目录无法由 `qfli-runner` 覆盖或修改属性，不代表应该跳过它们。先用 `ls -ld /home/qfli-runner/azurekiln-qfli-terminal{,/test,/docs}` 核对归属；确认是该专用源码目录后，以 root 修复归属并重跑新版安装器：
+
+```sh
+chown -h -R -P qfli-runner:"$(id -gn qfli-runner)" \
+  /home/qfli-runner/azurekiln-qfli-terminal
+```
+
+`-h -R -P` 不递归跟随符号链接；若新版预检仍指出只读文件、不可访问目录或符号链接，按报出的具体路径修复。旧版若已经停服，修复后需让新版安装器完成验收，服务才会恢复。
+
 脚本会优先从系统或宝塔已安装的 Node.js 22.9+ 复制一份到 `/usr/local/bin/qfli-node`；没有可用版本时从 Node.js 官网下载最新的 24.x Linux x64 包并校验 SHA-256。它还会校验 gVisor 下载、设置执行账号整体限额、配置专用 rootless Docker、构建沙箱镜像并写入专用密钥文件。随后用真实 Sessions 逐个编译/运行语言，验证隔离、快照、后台清理、重置、输出上限和命令超时，通过后才安装并启用终端服务，检查带认证的 `/health`。下载和首次镜像构建可能需要几分钟；已验收的同一源码版本在运行时重跑只检查健康，不重启 Docker 或终端。源码变化会停止旧终端、更新并重新验收；失败时保持终端禁用。
 
 在受支持的执行机升级旧版终端服务时，若服务因 Docker 启动失败而每 5 秒重启，先以 root 停止该专用用户服务，再上传新版目录并重新复制、运行安装器。安装器会迁移旧的 `runsc --rootless=true` 与单文件日志压缩设置，重启执行账号的 Docker，并先做一个无网络的 gVisor 容器启动检查；检查不通过时不会启动终端服务。
