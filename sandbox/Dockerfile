@@ -7,7 +7,7 @@ ARG NODE_SHA256=472655581fb851559730c48763e0c9d3bc25975c59d518003fc0849d3e4ba0f6
 ARG DART_VERSION=3.13.5
 ARG DART_SHA256=ea864bc64df30a6b8bdf30b2e32550f7717d9a890de8f40293aeabb924fe232b
 
-LABEL io.qfli.terminal.image="1" io.qfli.terminal.toolchains="2"
+LABEL io.qfli.terminal.image="1" io.qfli.terminal.toolchains="3"
 
 RUN apt-get -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
         -o Acquire::Retries=2 -o Acquire::ForceIPv4=true --error-on=any update \
@@ -23,7 +23,7 @@ RUN case "$DEBIAN_MIRROR" in http://*|https://*) ;; *) exit 1 ;; esac \
         -o Acquire::Retries=2 -o Acquire::ForceIPv4=true install -y --no-install-recommends \
         ca-certificates build-essential cmake pkg-config git curl unzip xz-utils \
         python3 python3-pip python3-venv python-is-python3 php-cli composer \
-        golang-go rustc cargo lua5.4 luarocks openjdk-21-jdk-headless maven \
+        golang-go rustc cargo lua5.4 luarocks openjdk-21-jdk-headless maven ruby \
     && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /opt/node \

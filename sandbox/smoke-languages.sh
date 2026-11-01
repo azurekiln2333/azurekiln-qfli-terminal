@@ -2,7 +2,7 @@
 set -eu
 umask 077
 
-language=${1:?pass one language: c cpp java lua node python php go rust dart}
+language=${1:?pass one language: c cpp java lua node typescript python php go rust dart ruby shell}
 work=$(mktemp -d /workspace/.qfli-smoke.XXXXXXXX)
 trap 'rm -rf -- "$work"' EXIT
 cd "$work"
@@ -42,6 +42,12 @@ case "$language" in
     expect node main.js
     npm --version >/dev/null
     ;;
+  typescript)
+    # The App runs .ts entries with Node's built-in transform, not tsc.
+    printf '%s\n' 'enum Status { Ok = "qfli-toolchain-ok" }' \
+      'const message: string = Status.Ok;' 'console.log(message);' > main.ts
+    expect node --experimental-transform-types --disable-warning=ExperimentalWarning main.ts
+    ;;
   python)
     printf '%s\n' 'print("qfli-toolchain-ok")' > main.py
     python3 -m venv venv
@@ -74,6 +80,14 @@ case "$language" in
     expect dart main.dart
     dart compile exe main.dart -o program >/dev/null
     expect ./program
+    ;;
+  ruby)
+    printf '%s\n' 'puts "qfli-toolchain-ok"' > main.rb
+    expect ruby main.rb
+    ;;
+  shell)
+    printf '%s\n' 'set -eu' 'value=qfli-toolchain-ok' 'printf "%s\n" "$value"' > main.sh
+    expect bash main.sh
     ;;
   *)
     printf 'Unsupported language: %s\n' "$language" >&2
