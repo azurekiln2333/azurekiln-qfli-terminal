@@ -1,6 +1,66 @@
 import os from 'node:os';
+import { readFileSync } from 'node:fs';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { sandboxImage } from './sandbox.js';
+
+const containerCgroupRoot = '/host/cgroup';
+
+// The lock records a host-visible PID, so container mode must share the host PID
+// namespace. The host cgroup mount lists the host PIDs of our own cgroup.
+function assertHostPidNamespace() {
+  const entry = readFileSync('/proc/self/cgroup', 'utf8').trim().split('\n')
+    .find(line => line.startsWith('0::'));
+  const path = entry ? entry.slice(3) : '';
+  if (!path.startsWith('/') || path.includes('..')) {
+    throw new Error('executor_requires_host_pid_namespace');
+  }
+  let procs = [];
+  try {
+    procs = readFileSync(`${containerCgroupRoot}${path}/cgroup.procs`, 'utf8').trim().split('\n');
+  } catch {
+    throw new Error('executor_requires_host_pid_namespace');
+  }
+  if (!procs.includes(String(process.pid))) {
+    throw new Error('executor_requires_host_pid_namespace');
+  }
+}
+
+function containerConfiguration(secret, image) {
+  // Rootless Docker maps container UID 0 to the dedicated non-root host account.
+  // Host root stays outside that mapping and appears as the overflow UID.
+  if (process.getuid() !== 0) throw new Error('executor_container_requires_rootless_root');
+  const hostUid = process.env.QFLI_RUNNER_HOST_UID ?? '';
+  if (!/^[1-9][0-9]{0,9}$/.test(hostUid)) throw new Error('executor_requires_host_uid');
+  const mapping = readFileSync('/proc/self/uid_map', 'utf8').trim().split('\n')
+    .map(line => line.trim().split(/\s+/));
+  if (mapping.length < 1 || mapping[0].length !== 3 || mapping[0][0] !== '0' ||
+      mapping[0][1] !== hostUid || mapping[0][2] !== '1') {
+    throw new Error('executor_requires_rootless_userns');
+  }
+  const runtimeDir = `/run/user/${hostUid}`;
+  const dockerHost = process.env.DOCKER_HOST ?? `unix://${runtimeDir}/docker.sock`;
+  if (process.env.QFLI_TERMINAL_RUNTIME_DIR !== runtimeDir ||
+      dockerHost !== `unix://${runtimeDir}/docker.sock` ||
+      (process.env.XDG_RUNTIME_DIR && process.env.XDG_RUNTIME_DIR !== runtimeDir)) {
+    throw new Error('executor_requires_local_rootless_socket');
+  }
+  if (process.env.QFLI_TERMINAL_CGROUP_ROOT !== containerCgroupRoot) {
+    throw new Error('executor_requires_host_cgroup_mount');
+  }
+  assertHostPidNamespace();
+  return {
+    secret,
+    image,
+    container: true,
+    uid: 0,
+    hostUid: Number(hostUid),
+    socket: `${runtimeDir}/docker.sock`,
+    runtimeDir,
+    cgroupRoot: containerCgroupRoot,
+    env: { PATH: '/usr/local/bin:/usr/bin:/bin', HOME: runtimeDir,
+      DOCKER_HOST: dockerHost, XDG_RUNTIME_DIR: runtimeDir },
+  };
+}
 
 export const requestContext = new AsyncLocalStorage();
 
@@ -22,27 +82,30 @@ export const limits = Object.freeze({
 });
 
 export function configuration() {
-  if (process.platform !== 'linux' || !process.getuid || process.getuid() === 0) {
-    throw new Error('executor_requires_nonroot_linux');
-  }
-  const account = os.userInfo();
-  if (account.username !== 'qfli-runner') throw new Error('executor_requires_dedicated_account');
+  if (process.platform !== 'linux') throw new Error('executor_requires_linux');
   const secret = process.env.QFLI_TERMINAL_SECRET ?? '';
   if (!/^[\x21-\x7e]{32,256}$/.test(secret)) throw new Error('executor_secret_invalid');
+  const image = process.env.QFLI_TERMINAL_IMAGE || sandboxImage;
+  if (!/^[a-z0-9][a-z0-9._/:@-]{0,250}$/.test(image)) throw new Error('executor_image_invalid');
+  if (process.env.QFLI_TERMINAL_CONTAINER === '1') return containerConfiguration(secret, image);
+  if (!process.getuid || process.getuid() === 0) throw new Error('executor_requires_nonroot_linux');
+  const account = os.userInfo();
+  if (account.username !== 'qfli-runner') throw new Error('executor_requires_dedicated_account');
   const runtimeDir = `/run/user/${account.uid}`;
   const dockerHost = process.env.DOCKER_HOST ?? `unix://${runtimeDir}/docker.sock`;
   if (dockerHost !== `unix://${runtimeDir}/docker.sock` ||
       (process.env.XDG_RUNTIME_DIR && process.env.XDG_RUNTIME_DIR !== runtimeDir)) {
     throw new Error('executor_requires_local_rootless_socket');
   }
-  const image = process.env.QFLI_TERMINAL_IMAGE || sandboxImage;
-  if (!/^[a-z0-9][a-z0-9._/:@-]{0,250}$/.test(image)) throw new Error('executor_image_invalid');
   return {
     secret,
     image,
+    container: false,
     uid: account.uid,
+    hostUid: account.uid,
     socket: `${runtimeDir}/docker.sock`,
     runtimeDir,
+    cgroupRoot: '/sys/fs/cgroup',
     env: { PATH: '/usr/local/bin:/usr/bin:/bin', HOME: account.homedir,
       DOCKER_HOST: dockerHost, XDG_RUNTIME_DIR: runtimeDir },
   };

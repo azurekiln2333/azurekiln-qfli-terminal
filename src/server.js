@@ -97,6 +97,10 @@ let config;
 try { config = configuration(); }
 catch (error) { log('configuration_failed', { code: error.message }); process.exit(1); }
 const secretHash = createHash('sha256').update(config.secret).digest();
+// A container publishes one loopback port; Docker forwards to the container
+// interface, so the container must bind the wildcard address. Bare-metal
+// installs keep the loopback-only listener.
+const listenHost = config.container ? '0.0.0.0' : '127.0.0.1';
 const sessions = new Sessions(config);
 let initializing = true;
 
@@ -120,7 +124,7 @@ async function handleRequest(req, res, requestId) {
   try {
     if (req.method === 'GET' && req.url === '/health') {
       status = !initializing && sessions.ready ? 200 : 503;
-      response(res, status, { ready: status === 200, requestId });
+      response(res, status, { ready: status === 200, capacity: sessions.capacity(), requestId });
       return;
     }
     if (!['/v1/exec', '/v1/exec/stream', '/v1/session'].includes(req.url) ||
@@ -195,11 +199,11 @@ server.on('error', error => {
   log('listener_failed', { code: error.code ?? 'listener_failure' });
   process.exitCode = 1;
 });
-server.listen(3101, '127.0.0.1', async () => {
+server.listen(3101, listenHost, async () => {
   try {
     await sessions.initialize();
     initializing = false;
-    log('executor_ready', { address: '127.0.0.1:3101' });
+    log('executor_ready', { address: `${listenHost}:3101` });
   } catch (error) {
     log('initialization_failed', { code: error.code ?? 'executor_failure' });
     server.close();

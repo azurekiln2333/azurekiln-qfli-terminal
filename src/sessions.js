@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, lstat, readdir, writeFile, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { Docker } from './docker.js';
+import { acquireInstanceLock } from './lock.js';
 import { ExecutorError, limits, log } from './config.js';
 import { sandboxEnvArgs, sandboxTmpfs } from './sandbox.js';
 
@@ -27,7 +28,31 @@ export class Sessions {
       ![...this.records.values()].some(record => record.deleting || record.uncertain);
   }
 
+  // Counters only: no user IDs, commands or credentials leave the executor.
+  capacity() {
+    return {
+      sessions: this.records.size,
+      running: this.running,
+      waiting: this.queue.length,
+      sessionsLimit: limits.sessions,
+      runningLimit: limits.running,
+      queueLimit: limits.waiting,
+    };
+  }
+
   async initialize() {
+    // Fence the shared engine before any engine read or orphan reconciliation.
+    this.releaseLock = await acquireInstanceLock(this.config.runtimeDir);
+    try {
+      await this.startEngine();
+    } catch (error) {
+      await this.releaseLock?.();
+      this.releaseLock = undefined;
+      throw error;
+    }
+  }
+
+  async startEngine() {
     this.imageId = await this.docker.validateEngine();
     if (this.stopping) throw new ExecutorError('executor_stopping');
     try { await mkdir(this.pendingDir, { mode: 0o700 }); }
@@ -392,6 +417,8 @@ export class Sessions {
     clearInterval(this.timer);
     this.drainQueue();
     const results = await Promise.allSettled([...this.records.values()].map(record => this.destroy(record)));
+    await this.releaseLock?.();
+    this.releaseLock = undefined;
     return results.every(result => result.status === 'fulfilled');
   }
 }

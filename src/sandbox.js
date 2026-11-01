@@ -1,6 +1,7 @@
-export const sandboxImage = 'qfli-terminal-sandbox:2';
-export const toolchainVersion = '2';
-export const languages = Object.freeze(['c', 'cpp', 'java', 'lua', 'node', 'python', 'php', 'go', 'rust', 'dart']);
+export const sandboxImage = 'qfli-terminal-sandbox:3';
+export const toolchainVersion = '3';
+export const languages = Object.freeze(['c', 'cpp', 'java', 'lua', 'node', 'typescript', 'python',
+  'php', 'go', 'rust', 'dart', 'ruby', 'shell']);
 export const sandboxTmpfs = Object.freeze({
   '/workspace': 'rw,nosuid,nodev,exec,size=256m,mode=0700,uid=65532,gid=65532',
   '/tmp': 'rw,nosuid,nodev,noexec,size=64m,mode=1777',

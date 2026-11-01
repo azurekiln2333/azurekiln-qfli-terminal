@@ -16,6 +16,19 @@ export function accountBudgetValid({ memory, swap, pids, cpu }) {
     Number(cpuParts[0]) <= Number(cpuParts[1]);
 }
 
+export async function readAccountLimits(base) {
+  try {
+    const [memory, swap, pids, cpu] = await Promise.all(
+      ['memory.max', 'memory.swap.max', 'pids.max', 'cpu.max']
+        .map(file => readFile(path.join(base, file), 'utf8')));
+    return { memory, swap, pids, cpu };
+  } catch {
+    // A freshly booted host can briefly lack the slice limit files. Report the
+    // same fail-closed code as ineffective limits, never a raw errno.
+    throw new ExecutorError('sandbox_resource_controls_missing');
+  }
+}
+
 export class Docker {
   constructor(config) { this.config = config; }
 
@@ -158,17 +171,22 @@ export class Docker {
   }
 
   async validateAccountBudget() {
-    const root = '/sys/fs/cgroup';
-    const base = `${root}/user.slice/user-${this.config.uid}.slice`;
+    const root = this.config.cgroupRoot;
+    // Host slice paths use the host account UID. In a rootless container the
+    // process UID is 0 but the dedicated account still owns user-<hostUid>.slice.
+    const base = `${root}/user.slice/user-${this.config.hostUid}.slice`;
     const [state, rootState, filesystem] = await Promise.all([lstat(base), lstat(root), statfs(root)]);
-    // User-service filesystem protection maps host root to the overflow UID.
-    if (filesystem.type !== 0x63677270 || !rootState.isDirectory() ||
-        rootState.uid === this.config.uid || !state.isDirectory() || state.uid !== rootState.uid) {
+    // Host-service protection maps host root to the overflow UID. A rootless
+    // container maps its own root to the runner UID, so host root must still
+    // appear as overflow. Reject a container that runs as real host root.
+    const rootOwnerInvalid = this.config.container
+      ? rootState.uid !== 65534 || state.uid !== 65534
+      : rootState.uid === this.config.uid;
+    if (filesystem.type !== 0x63677270 || !rootState.isDirectory() || rootOwnerInvalid ||
+        !state.isDirectory() || state.uid !== rootState.uid) {
       throw new ExecutorError('account_cgroup_invalid');
     }
-    const [memory, swap, pids, cpu] = await Promise.all(
-      ['memory.max', 'memory.swap.max', 'pids.max', 'cpu.max']
-        .map(file => readFile(path.join(base, file), 'utf8')));
+    const { memory, swap, pids, cpu } = await readAccountLimits(base);
     if (!accountBudgetValid({ memory, swap, pids, cpu })) {
       throw new ExecutorError('sandbox_resource_controls_missing');
     }
@@ -200,7 +218,7 @@ export class Docker {
     const membership = await readFile(`/proc/${container.State.Pid}/cgroup`, 'utf8');
     const entry = membership.trim().split('\n').find(line => line.startsWith('0::'));
     const relative = entry?.slice(3);
-    const account = `/user.slice/user-${this.config.uid}.slice/`;
+    const account = `/user.slice/user-${this.config.hostUid}.slice/`;
     if (!relative?.startsWith(account) || relative.split('/').includes('..')) {
       throw new ExecutorError('sandbox_cgroup_invalid');
     }
