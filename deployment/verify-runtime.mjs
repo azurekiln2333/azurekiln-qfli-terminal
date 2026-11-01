@@ -1,17 +1,13 @@
-import net from 'node:net';
-import { once } from 'node:events';
 import { readFile } from 'node:fs/promises';
 import { configuration } from '../src/config.js';
 import { Sessions } from '../src/sessions.js';
 import { languages } from '../src/sandbox.js';
 
+// Sessions.initialize() takes the engine-wide instance lock, so another
+// executor or verification run cannot reconcile these containers in parallel.
 const sessions = new Sessions(configuration());
-const lock = net.createServer(socket => socket.destroy());
-// Use the executor's port lock before reconciling its owned containers.
-lock.listen(3101, '127.0.0.1');
-await once(lock, 'listening');
+await sessions.initialize();
 try {
-  await sessions.initialize();
   const check = async (command, expected, options) => {
     const result = await sessions.execute('installation-verifier', command,
       new AbortController().signal, options);
@@ -57,6 +53,5 @@ try {
   }
 } finally {
   const cleaned = await sessions.shutdown();
-  await new Promise(resolve => lock.close(resolve));
   if (!cleaned) throw new Error('toolchain_verification_cleanup_failed');
 }

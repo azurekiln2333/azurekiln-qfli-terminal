@@ -1,0 +1,79 @@
+# Image-only production stack for one isolated terminal executor node.
+# Run it as the dedicated qfli-runner account against that account's rootless
+# Docker engine. Nothing here builds source code.
+#
+# Requires QFLI_RUNNER_HOST_UID (see .env.example). Both services are separate:
+# no depends_on, independent restart and independent watchtower scope.
+services:
+  executor:
+    image: "${QFLI_TERMINAL_SERVICE_IMAGE:-docker.cnb.cool/azurekiln/qflistudio-next/qfli-terminal}"
+    restart: unless-stopped
+    init: true
+    pid: host
+    # Host cgroup namespace is required: a private namespace would show
+    # /proc/<host pid>/cgroup relative to the container root, not user.slice.
+    cgroup: host
+    env_file:
+      - .env
+    environment:
+      QFLI_TERMINAL_CONTAINER: "1"
+      QFLI_RUNNER_HOST_UID: "${QFLI_RUNNER_HOST_UID:?set the qfli-runner host UID}"
+      QFLI_TERMINAL_RUNTIME_DIR: /run/user/${QFLI_RUNNER_HOST_UID}
+      QFLI_TERMINAL_CGROUP_ROOT: /host/cgroup
+      HOME: /run/user/${QFLI_RUNNER_HOST_UID}
+    ports:
+      - "127.0.0.1:3101:3101"
+    volumes:
+      # Dedicated rootless engine socket plus executor create journal.
+      - "/run/user/${QFLI_RUNNER_HOST_UID}:/run/user/${QFLI_RUNNER_HOST_UID}"
+      # Read-only host cgroup hierarchy for effective limit verification.
+      - "/sys/fs/cgroup:/host/cgroup:ro"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    cpus: "0.50"
+    pids_limit: 256
+    labels:
+      com.centurylinklabs.watchtower.enable: "${QFLI_TERMINAL_AUTO_UPDATE:-true}"
+      com.centurylinklabs.watchtower.scope: qfli-terminal
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "node", "deployment/check-health.mjs"]
+      interval: 30s
+      timeout: 8s
+      start_period: 30s
+      retries: 3
+
+  # Independent updater for the executor image only. It uses the dedicated
+  # rootless socket, never the host root Docker socket.
+  watchtower:
+    image: "${QFLI_TERMINAL_WATCHTOWER_IMAGE:-nickfedor/watchtower:1.23.2}"
+    restart: unless-stopped
+    environment:
+      WATCHTOWER_LABEL_ENABLE: "true"
+      WATCHTOWER_SCOPE: qfli-terminal
+      WATCHTOWER_POLL_INTERVAL: "${WATCHTOWER_POLL_INTERVAL:-600}"
+      WATCHTOWER_CLEANUP: "true"
+      DOCKER_HOST: unix:///var/run/docker.sock
+    volumes:
+      - "/run/user/${QFLI_RUNNER_HOST_UID}/docker.sock:/var/run/docker.sock"
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
+      com.centurylinklabs.watchtower.scope: qfli-terminal
+    mem_limit: 64m
+    cpus: "0.10"
+    pids_limit: 128
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

@@ -1,0 +1,21 @@
+[Unit]
+Description=QFLI isolated terminal executor stack
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=%h/qfli-terminal
+Environment=HOME=%h
+Environment=XDG_RUNTIME_DIR=%t
+Environment=DOCKER_HOST=unix://%t/docker.sock
+ExecStart=/usr/bin/docker compose --project-directory %h/qfli-terminal up -d --remove-orphans
+ExecStop=/usr/bin/docker compose --project-directory %h/qfli-terminal down
+TimeoutStartSec=300
+TimeoutStopSec=120
+UMask=0077
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

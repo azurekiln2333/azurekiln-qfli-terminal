@@ -1,0 +1,15 @@
+node_modules
+test
+docs
+sandbox
+.env
+.env.*
+!.env.example
+*.log
+.git
+.gitignore
+.gitattributes
+Dockerfile
+docker-compose*.yaml
+.cnb.yml
+README.md

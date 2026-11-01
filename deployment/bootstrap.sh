@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Image-only installer for the isolated terminal executor container.
+# It prepares the host, pulls prebuilt images, verifies real gVisor sessions,
+# then starts the executor stack. It never builds or runs Node on the host.
 set -Eeuo pipefail
 export LC_ALL=C
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -6,23 +9,22 @@ umask 077
 
 runner=qfli-runner
 business_env=''
-debian_mirror='http://mirrors.tuna.tsinghua.edu.cn'
-registry_mirror=''
-base_image=debian:trixie-slim
 input_source=''
-sandbox_image=qfli-terminal-sandbox:2
-download_dir=''
-node_download_dir=''
-release_stage_dir=''
-node_bin=/usr/local/bin/qfli-node
-release_entries=(src sandbox deployment test docs package.json README.md .env.example)
+registry_mirror=''
+sandbox_image=docker.cnb.cool/azurekiln/qflistudio-next/qfli-terminal-sandbox:3
+executor_image=docker.cnb.cool/azurekiln/qflistudio-next/qfli-terminal:latest
+sandbox_image_set=0
+release_entries=(docker-compose.yaml .env.example deployment/docker-daemon.json \
+  deployment/qfli-terminal-compose.service deployment/check-health.mjs \
+  deployment/verify-runtime.mjs)
 
 usage() {
   printf '%s\n' \
-    'Usage: bash deployment/bootstrap.sh [--source-dir PATH] [--business-env PATH] [--registry-mirror HTTPS_URL] [--debian-mirror URL] [--base-image IMAGE]' \
+    'Usage: bash deployment/bootstrap.sh [--source-dir PATH] [--business-env PATH]' \
+    '       [--registry-mirror HTTPS_URL] [--sandbox-image IMAGE] [--executor-image IMAGE]' \
     'Run as root on Ubuntu 24.04 or Alibaba Cloud Linux 3 with cgroup v2.' \
-    'An existing backend secret is required.' \
-    'Without --business-env, the script prompts for that secret without echoing it.'
+    'The sandbox and executor images are pulled; nothing is built on the server.' \
+    'An existing backend secret is required.'
 }
 
 fail() {
@@ -35,16 +37,9 @@ step() {
 }
 
 cleanup() {
-  if [[ -n "$download_dir" ]]; then
+  if [[ -n "${download_dir:-}" ]]; then
     rm -f -- "$download_dir/gvisor.tar.zstd" "$download_dir/gvisor.tar.zstd.sha512"
     rmdir -- "$download_dir" 2>/dev/null || true
-  fi
-  if [[ "$node_download_dir" == /var/tmp/qfli-node.* ]]; then
-    rm -rf -- "$node_download_dir"
-  fi
-  if [[ "$release_stage_dir" == /var/tmp/qfli-release.* ]]; then
-    rm -f -- "$release_stage_dir/release.tar"
-    rmdir -- "$release_stage_dir" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
@@ -61,19 +56,20 @@ while (($#)); do
       input_source=$2
       shift 2
       ;;
-    --debian-mirror)
-      (($# >= 2)) || fail '--debian-mirror requires a URL'
-      debian_mirror=$2
-      shift 2
-      ;;
     --registry-mirror)
       (($# >= 2)) || fail '--registry-mirror requires an HTTPS URL'
       registry_mirror=$2
       shift 2
       ;;
-    --base-image)
-      (($# >= 2)) || fail '--base-image requires an administrator-selected trusted image'
-      base_image=$2
+    --sandbox-image)
+      (($# >= 2)) || fail '--sandbox-image requires an image reference'
+      sandbox_image=$2
+      sandbox_image_set=1
+      shift 2
+      ;;
+    --executor-image)
+      (($# >= 2)) || fail '--executor-image requires an image reference'
+      executor_image=$2
       shift 2
       ;;
     -h|--help)
@@ -107,7 +103,6 @@ for command in awk flock systemctl "$package_manager"; do
 done
 exec 9>/run/lock/qfli-terminal-bootstrap.lock
 flock -n 9 || fail 'another terminal installation is already running'
-[[ ! -L "$node_bin" ]] || fail 'dedicated Node.js path must not be a symlink'
 
 configure_al3_docker_repo() {
   printf '%s\n' '[docker-ce-stable]' 'name=Docker CE Stable - x86_64' \
@@ -122,7 +117,7 @@ fi
 step 'preparing host packages for rootless Docker'
 needs_packages=0
 for command in curl newuidmap newgidmap dbus-daemon slirp4netns fuse-overlayfs xz zstd \
-  tar cmp getent install loginctl runuser sha256sum sha512sum realpath find sort xargs useradd usermod passwd ps ip; do
+  tar cmp getent install loginctl runuser sha256sum sha512sum realpath find sort xargs useradd usermod passwd ps ip python3; do
   command -v "$command" >/dev/null || needs_packages=1
 done
 if ((needs_packages)); then
@@ -142,8 +137,7 @@ fi
 slirp4netns --version >/dev/null || fail 'slirp4netns is installed but cannot run'
 fuse-overlayfs --version >/dev/null || fail 'fuse-overlayfs is installed but cannot run'
 
-if ! command -v docker >/dev/null; then
-  step 'installing Docker from its signed official repository'
+install_docker_packages() {
   if [[ "$package_manager" == apt-get ]]; then
     install -d -m 0755 /etc/apt/keyrings
     curl --fail --location --retry 3 --output /etc/apt/keyrings/qfli-docker.asc \
@@ -152,22 +146,28 @@ if ! command -v docker >/dev/null; then
     printf '%s\n' 'deb [arch=amd64 signed-by=/etc/apt/keyrings/qfli-docker.asc] https://download.docker.com/linux/ubuntu noble stable' \
       > /etc/apt/sources.list.d/qfli-docker.list
     apt-get update
-    apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-ce-rootless-extras
+    apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-ce-rootless-extras
   else
     configure_al3_docker_repo
-    dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-ce-rootless-extras
+    dnf install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-ce-rootless-extras
   fi
+}
+if ! command -v docker >/dev/null; then
+  step 'installing Docker and the Compose plugin from signed repositories'
+  install_docker_packages
 elif ! command -v dockerd-rootless-setuptool.sh >/dev/null; then
+  step 'installing the missing rootless Docker extras'
   if [[ "$package_manager" == apt-get ]]; then
-    apt-get install -y docker-ce-rootless-extras
+    apt-get install -y docker-compose-plugin docker-ce-rootless-extras
   else
     configure_al3_docker_repo
-    dnf install -y docker-ce-rootless-extras
+    dnf install -y docker-compose-plugin docker-ce-rootless-extras
   fi
 fi
 for command in docker dockerd-rootless-setuptool.sh newuidmap newgidmap; do
   command -v "$command" >/dev/null || fail "rootless Docker prerequisite is missing: $command"
 done
+docker compose version >/dev/null 2>&1 || fail 'the Docker Compose plugin is missing'
 
 if ! id "$runner" >/dev/null 2>&1; then
   useradd --create-home --shell /bin/bash "$runner"
@@ -187,182 +187,83 @@ for mapping in /etc/subuid /etc/subgid; do
   fi
 done
 
-node_supported() {
-  env -i PATH=/usr/bin:/bin "$1" -e '
-    const [major, minor] = process.versions.node.split(".").map(Number);
-    process.exit(major > 22 || (major === 22 && minor >= 9) ? 0 : 1);
-  ' >/dev/null 2>&1
-}
-
-if [[ ! -e "$node_bin" ]]; then
-  for candidate in /usr/bin/node /usr/local/bin/node \
-    /www/server/nodejs/v*/bin/node /www/server/nodejs/*/bin/node \
-    /www/server/nvm/versions/node/v*/bin/node; do
-    if [[ -x "$candidate" ]] && node_supported "$candidate"; then
-      step "installing dedicated Node.js from $candidate"
-      install -m 0755 "$candidate" "$node_bin"
-      break
-    fi
-  done
-fi
-
-if [[ ! -e "$node_bin" ]]; then
-  step 'downloading official Node.js 24 for the dedicated executor'
-  if ! command -v xz >/dev/null; then
-    if [[ "$package_manager" == apt-get ]]; then
-      apt-get update
-      apt-get install -y xz-utils
-    else
-      dnf install -y xz
-    fi
-  fi
-  node_download_dir=$(mktemp -d /var/tmp/qfli-node.XXXXXXXX)
-  node_release_url='https://nodejs.org/dist/latest-v24.x'
-  curl --fail --location --retry 3 --output "$node_download_dir/SHASUMS256.txt" \
-    "$node_release_url/SHASUMS256.txt"
-  node_archive=$(awk '$2 ~ /^node-v24\.[0-9]+\.[0-9]+-linux-x64\.tar\.xz$/ { print $2 }' \
-    "$node_download_dir/SHASUMS256.txt")
-  [[ "$node_archive" =~ ^node-v24\.[0-9]+\.[0-9]+-linux-x64\.tar\.xz$ ]] ||
-    fail 'official Node.js 24 checksum manifest has no unique Linux x64 archive'
-  curl --fail --location --retry 3 --output "$node_download_dir/$node_archive" \
-    "$node_release_url/$node_archive"
-  node_sha=$(awk -v name="$node_archive" '$2 == name { print $1 }' \
-    "$node_download_dir/SHASUMS256.txt")
-  [[ "$node_sha" =~ ^[0-9a-f]{64}$ ]] || fail 'official Node.js checksum is invalid'
-  (cd "$node_download_dir" && printf '%s  %s\n' "$node_sha" "$node_archive" | sha256sum -c -)
-  node_top=${node_archive%.tar.xz}
-  xz -dc "$node_download_dir/$node_archive" |
-    tar -xf - -C "$node_download_dir" "$node_top/bin/node"
-  install -m 0755 "$node_download_dir/$node_top/bin/node" "$node_bin"
-fi
-[[ -x "$node_bin" ]] && node_supported "$node_bin" ||
-  fail 'dedicated Node.js 22.9 or newer is required'
-
 runner_uid=$(id -u "$runner") || fail "missing account: $runner"
 runner_home=$(getent passwd "$runner" | cut -d: -f6)
 [[ -d "$runner_home" ]] || fail "missing runner home: $runner_home"
-source_dir="$runner_home/azurekiln-qfli-terminal"
+project_dir="$runner_home/qfli-terminal"
+legacy_env="$runner_home/.config/qfli-terminal/runner.env"
+backup_dir="$runner_home/.config/qfli-terminal"
+installed_receipt="$backup_dir/installed.json"
+
+as_runner() {
+  # runuser keeps the caller's cwd; an unreadable one such as /root breaks find.
+  (
+    cd "$runner_home" || exit
+    exec runuser -u "$runner" -- env -i HOME="$runner_home" USER="$runner" LOGNAME="$runner" \
+      PATH=/usr/local/bin:/usr/bin:/bin \
+      XDG_RUNTIME_DIR="/run/user/$runner_uid" \
+      DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$runner_uid/bus" \
+      DOCKER_HOST="unix:///run/user/$runner_uid/docker.sock" "$@"
+  )
+}
+
+compose() {
+  as_runner docker compose --project-directory "$project_dir" "$@"
+}
+
+read_env_value() {
+  local file=$1 key=$2 line
+  [[ -f "$file" ]] || return 0
+  line=$(grep -m1 "^${key}=" "$file" 2>/dev/null || true)
+  printf '%s' "${line#*=}" | tr -d '\r'
+}
+
+[[ "$sandbox_image" =~ ^[a-z0-9][a-z0-9._/:@-]{0,250}$ ]] || fail 'invalid sandbox image reference'
+[[ "$executor_image" =~ ^[a-z0-9][a-z0-9._/:@-]{0,250}$ ]] || fail 'invalid executor image reference'
+
+# Resolve the release source that provides docker-compose.yaml.
 if [[ -n "$input_source" ]]; then
   input_source=$(realpath -- "$input_source")
 fi
-release_source=${input_source:-$source_dir}
-for entry in "${release_entries[@]}"; do
-  [[ -e "$release_source/$entry" ]] || fail "source directory is incomplete: missing $release_source/$entry"
-done
-for entry in src sandbox deployment test docs; do
-  [[ -d "$release_source/$entry" ]] || fail "release entry must be a directory: $release_source/$entry"
-done
-for entry in package.json README.md .env.example src/server.js deployment/qfli-terminal.service \
-  deployment/check-health.mjs deployment/verify-runtime.mjs sandbox/smoke-languages.sh \
-  deployment/docker-daemon.json sandbox/Dockerfile; do
-  [[ -f "$release_source/$entry" ]] || fail "release entry must be a file: $release_source/$entry"
-done
-
-as_runner() {
-  runuser -u "$runner" -- env -i HOME="$runner_home" USER="$runner" LOGNAME="$runner" \
-    PATH=/usr/local/bin:/usr/bin:/bin \
-    XDG_RUNTIME_DIR="/run/user/$runner_uid" \
-    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$runner_uid/bus" \
-    DOCKER_HOST="unix:///run/user/$runner_uid/docker.sock" "$@"
-}
-
-runner_env="$runner_home/.config/qfli-terminal/runner.env"
-[[ ! -L "$runner_env" ]] || fail 'runner.env must not be a symlink'
-read_secret() {
-  env -i PATH=/usr/bin:/bin "$node_bin" -e '
-    const fs = require("node:fs");
-    const { parseEnv } = require("node:util");
-    process.stdout.write(parseEnv(fs.readFileSync(process.argv[1], "utf8")).QFLI_TERMINAL_SECRET ?? "");
-  ' "$1"
-}
-
-if [[ -n "$business_env" ]]; then
-  [[ -f "$business_env" && -r "$business_env" ]] || fail "cannot read business env: $business_env"
-  business_secret=$(read_secret "$business_env")
-  [[ -n "$business_secret" ]] || fail 'business env has no QFLI_TERMINAL_SECRET'
-fi
-
-if [[ -f "$runner_env" ]]; then
-  secret=$(read_secret "$runner_env")
-  [[ -z "${business_secret:-}" || "$business_secret" == "$secret" ]] ||
-    fail 'business and runner secrets differ; reconcile them before continuing'
-elif [[ -n "${business_secret:-}" ]]; then
-  secret=$business_secret
-else
-  [[ -t 0 ]] || fail 'pass --business-env or run interactively to enter the backend secret'
-  read -r -s -p 'Existing backend QFLI_TERMINAL_SECRET: ' secret
-  printf '\n'
-fi
-[[ "$secret" =~ ^[0-9a-fA-F]{64}$ ]] ||
-  fail 'the installer requires the recommended 64-character hexadecimal shared secret'
-unset business_secret
-
-if [[ "$release_source" != "$source_dir" ]]; then
-  step 'checking release overwrite permissions before stopping the executor'
-  [[ ! -L "$source_dir" ]] || fail "release directory must not be a symlink: $source_dir"
-  if [[ -e "$source_dir" ]]; then
-    [[ -d "$source_dir" ]] || fail "release destination must be a directory: $source_dir"
-    as_runner test -O "$source_dir" && as_runner test -w "$source_dir" && \
-      as_runner test -x "$source_dir" ||
-      fail "release directory must be owned and writable by $runner: $source_dir; repair its ownership/permissions and rerun"
-    for entry in "${release_entries[@]}"; do
-      target="$source_dir/$entry"
-      [[ -e "$target" || -L "$target" ]] || continue
-      if [[ -d "$release_source/$entry" ]]; then
-        [[ -d "$target" && ! -L "$target" ]] || fail "release destination must be a directory: $target"
-      else
-        [[ -f "$target" && ! -L "$target" ]] || fail "release destination must be a regular file: $target"
-      fi
-      # Tar changes directory metadata too, even when a root-owned path is writable.
-      blocked=$(as_runner find "$target" -xdev \
-        \( -type l -o ! -uid "$runner_uid" -o ! -writable -o \( -type d ! -executable \) \) \
-        -print -quit) || fail "cannot inspect release destination as $runner: $target"
-      [[ -z "$blocked" ]] ||
-        fail "release overwrite blocked at $blocked; managed paths must be owned/writable by $runner, directories traversable, and symlinks absent; repair and rerun"
-    done
+release_source=${input_source:-}
+if [[ -z "$release_source" ]]; then
+  if [[ -f "$project_dir/docker-compose.yaml" ]]; then
+    release_source=$project_dir
   else
-    as_runner install -d -m 0755 "$source_dir" || fail "cannot create release destination as $runner: $source_dir"
+    fail 'pass --source-dir with a directory that contains docker-compose.yaml'
   fi
-  release_stage_dir=$(mktemp -d /var/tmp/qfli-release.XXXXXXXX)
-  tar -C "$release_source" -cf "$release_stage_dir/release.tar" "${release_entries[@]}" ||
-    fail 'cannot archive the complete release; executor has not been stopped'
 fi
+for entry in "${release_entries[@]}"; do
+  [[ -f "$release_source/$entry" ]] || fail "source is incomplete: missing $release_source/$entry"
+done
 
 step 'starting the dedicated user manager'
 loginctl enable-linger "$runner"
 systemctl start "user@$runner_uid.service"
-source_fingerprint=$(
-  cd "$release_source"
-  find "${release_entries[@]}" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d " " -f1
-)
-receipt="$runner_home/.config/qfli-terminal/validated-source.sha256"
-if as_runner systemctl --user is-active --quiet qfli-terminal.service; then
-  installed_unit="$runner_home/.config/systemd/user/qfli-terminal.service"
-  previous_fingerprint=$(as_runner cat "$receipt" 2>/dev/null || true)
-  if [[ "$previous_fingerprint" == "$source_fingerprint" ]] && \
-     [[ -z "$registry_mirror" && "$base_image" == debian:trixie-slim && \
-        "$debian_mirror" == http://mirrors.tuna.tsinghua.edu.cn ]] && \
-     cmp -s "$release_source/deployment/qfli-terminal.service" "$installed_unit"; then
-    step 'this release already runs; checking authenticated health'
-    as_runner "$node_bin" "$source_dir/deployment/check-health.mjs"
-    as_runner systemctl --user enable qfli-terminal.service
-    printf 'QFLI terminal setup: installed and enabled at boot\n'
-    exit 0
-  fi
-fi
-if as_runner systemctl --user cat qfli-terminal.service >/dev/null 2>&1; then
-  step 'stopping the previous executor for verified upgrade'
-  as_runner systemctl --user disable --now qfli-terminal.service
-fi
-if [[ "$release_source" != "$source_dir" ]]; then
-  cat "$release_stage_dir/release.tar" | \
-    as_runner tar -C "$source_dir" --no-same-owner -xf -
-fi
 
 step 'installing account resource limits'
+# A transient `set-property` drop-in lives under /run and disappears on reboot,
+# which drops CPUQuota after a restart. Write a persistent slice drop-in first,
+# then apply the same values for immediate effect.
+install -d -m 0755 "/etc/systemd/system/user-$runner_uid.slice.d"
+cat > "/etc/systemd/system/user-$runner_uid.slice.d/50-qfli-limits.conf" <<'QFLI_SLICE'
+[Slice]
+CPUAccounting=yes
+MemoryAccounting=yes
+TasksAccounting=yes
+CPUQuota=100%
+MemoryHigh=768M
+MemoryMax=1G
+MemorySwapMax=0
+TasksMax=1024
+QFLI_SLICE
+systemctl daemon-reload
 systemctl set-property "user-$runner_uid.slice" \
   CPUAccounting=yes MemoryAccounting=yes TasksAccounting=yes \
   CPUQuota=100% MemoryHigh=768M MemoryMax=1G MemorySwapMax=0 TasksMax=1024
+# The persistent drop-in must exist for the limits to survive a reboot.
+[[ -s "/etc/systemd/system/user-$runner_uid.slice.d/50-qfli-limits.conf" ]] ||
+  fail 'the persistent account limit drop-in was not written'
 
 if [[ ! -x /usr/local/bin/runsc || ! -x /usr/local/bin/containerd-shim-runsc-v1 || \
       ! -d /usr/local/bin/gvisor-bin ]]; then
@@ -390,75 +291,138 @@ fi
    -d /usr/local/bin/gvisor-bin ]] || fail 'the gVisor release is incomplete'
 /usr/local/bin/runsc --version
 
+# Resolve the shared executor secret from the installed stack, a legacy host
+# install, the business env, or hidden input. The business environment is never
+# copied to the runner.
+if [[ -n "$business_env" ]]; then
+  business_env=$(realpath -e -- "$business_env") || fail "business env does not exist: $business_env"
+  [[ -f "$business_env" ]] || fail "business env must be a regular file: $business_env"
+  business_secret=$(read_env_value "$business_env" QFLI_TERMINAL_SECRET)
+  [[ -n "$business_secret" ]] || fail 'business env has no QFLI_TERMINAL_SECRET'
+fi
+current_secret=''
+if [[ -f "$project_dir/.env" ]]; then
+  current_secret=$(read_env_value "$project_dir/.env" QFLI_TERMINAL_SECRET)
+elif [[ -f "$legacy_env" ]]; then
+  current_secret=$(read_env_value "$legacy_env" QFLI_TERMINAL_SECRET)
+  legacy_sandbox=$(read_env_value "$legacy_env" QFLI_TERMINAL_IMAGE)
+  if ((!sandbox_image_set)) && [[ -n "$legacy_sandbox" ]]; then
+    sandbox_image=$legacy_sandbox
+  fi
+fi
+if [[ -n "${business_secret:-}" && -n "$current_secret" && "$business_secret" != "$current_secret" ]]; then
+  fail 'business and runner secrets differ; reconcile them before continuing'
+fi
+secret=${current_secret:-${business_secret:-}}
+if [[ -z "$secret" ]]; then
+  [[ -t 0 ]] || fail 'pass --business-env or run interactively to enter the backend secret'
+  read -r -s -p 'Existing backend QFLI_TERMINAL_SECRET: ' secret
+  printf '\n'
+fi
+[[ "$secret" =~ ^[0-9a-fA-F]{64}$ ]] ||
+  fail 'the installer requires the recommended 64-character hexadecimal shared secret'
+unset business_secret current_secret legacy_sandbox
+
+step 'preparing the compose project directory'
+[[ ! -L "$project_dir" ]] || fail "compose project must not be a symlink: $project_dir"
+if [[ -e "$project_dir" ]]; then
+  [[ -d "$project_dir" ]] || fail "compose project must be a directory: $project_dir"
+  as_runner test -O "$project_dir" && as_runner test -w "$project_dir" && as_runner test -x "$project_dir" ||
+    fail "compose project must be owned and writable by $runner: $project_dir"
+  blocked=$(as_runner find "$project_dir" -xdev \
+    \( -type l -o ! -uid "$runner_uid" -o ! -writable -o \( -type d ! -executable \) \) \
+    -print -quit) || fail "cannot inspect compose project as $runner"
+  [[ -z "$blocked" ]] || fail "compose project path is not writable by $runner: $blocked"
+else
+  as_runner install -d -m 0755 "$project_dir" || fail "cannot create $project_dir"
+fi
+
 step 'checking the dedicated rootless Docker configuration'
 docker_config="$runner_home/.config/docker/daemon.json"
+docker_changed=0
+docker_config_before=$(sha256sum "$docker_config" 2>/dev/null || true)
 as_runner install -d -m 0700 "$runner_home/.config/docker"
 [[ ! -L "$docker_config" ]] || fail 'Docker daemon.json must not be a symlink'
 if [[ ! -e "$docker_config" ]]; then
-  as_runner install -m 0644 \
-    "$source_dir/deployment/docker-daemon.json" "$docker_config"
+  as_runner install -m 0644 "$release_source/deployment/docker-daemon.json" "$docker_config"
 else
-  as_runner "$node_bin" -e '
-    const fs = require("node:fs");
-    const file = process.argv[1];
-    const data = JSON.parse(fs.readFileSync(file, "utf8"));
-    const runtime = data.runtimes?.runsc;
-    const args = JSON.stringify(runtime?.runtimeArgs);
-    const previous = JSON.stringify(["--rootless=true", "--network=none"]);
-    const current = JSON.stringify(["--network=none"]);
-    const target = JSON.stringify(["--network=none", "--ignore-cgroups"]);
-    if (runtime?.path !== "/usr/local/bin/runsc" ||
-        ![previous, current, target].includes(args)) {
-      console.error("rootless Docker runsc settings do not match deployment/docker-daemon.json");
-      process.exit(1);
-    }
-    const logs = data["log-opts"];
-    const fixLogs = data["log-driver"] === "local" && logs?.["max-file"] === "1" &&
-      logs.compress !== "false";
-    if (args !== target || fixLogs) {
-      runtime.runtimeArgs = ["--network=none", "--ignore-cgroups"];
-      if (fixLogs) logs.compress = "false";
-      const temp = `${file}.${process.pid}.tmp`;
-      fs.writeFileSync(temp, `${JSON.stringify(data, null, 2)}\n`, { flag: "wx", mode: 0o600 });
-      fs.renameSync(temp, file);
-    }
-  ' "$docker_config" ||
-    fail 'fix the dedicated Docker configuration first'
+  as_runner python3 - "$docker_config" <<'PY'
+import json, os, sys
+file = sys.argv[1]
+with open(file, encoding="utf-8") as handle:
+    data = json.load(handle)
+runtime = data.get("runtimes", {}).get("runsc", {})
+allowed = [
+    ["--network=none", "--ignore-cgroups"],
+    ["--network=none"],
+    ["--rootless=true", "--network=none"],
+]
+target = ["--network=none", "--ignore-cgroups"]
+if runtime.get("path") != "/usr/local/bin/runsc" or runtime.get("runtimeArgs") not in allowed:
+    raise SystemExit("rootless Docker runsc settings do not match deployment/docker-daemon.json")
+logs = data.get("log-opts")
+fix_logs = data.get("log-driver") == "local" and logs.get("max-file") == "1" and logs.get("compress") != "false"
+if runtime.get("runtimeArgs") != target or fix_logs:
+    runtime["runtimeArgs"] = target
+    if fix_logs:
+        logs["compress"] = "false"
+    temp = f"{file}.{os.getpid()}.tmp"
+    with open(temp, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2)
+        handle.write("\n")
+    os.chmod(temp, 0o600)
+    os.replace(temp, file)
+PY
 fi
 
 if [[ -n "$registry_mirror" ]]; then
-  as_runner "$node_bin" -e '
-    const fs = require("node:fs");
-    const path = process.argv[1];
-    const url = new URL(process.argv[2]);
-    if (url.protocol !== "https:" || url.username || url.password ||
-        url.search || url.hash || url.pathname !== "/") {
-      throw new Error("registry mirror must be an HTTPS origin without credentials or a path");
-    }
-    const config = JSON.parse(fs.readFileSync(path, "utf8"));
-    const mirrors = config["registry-mirrors"] ?? [];
-    if (!Array.isArray(mirrors) || mirrors.some(value => typeof value !== "string")) {
-      throw new Error("existing registry-mirrors must be an array of URLs");
-    }
-    const updated = [url.origin, ...mirrors.filter(value => value !== url.origin)];
-    if (JSON.stringify(updated) !== JSON.stringify(mirrors)) {
-      config["registry-mirrors"] = updated;
-      const temp = `${path}.${process.pid}.tmp`;
-      fs.writeFileSync(temp, `${JSON.stringify(config, null, 2)}\n`, { flag: "wx", mode: 0o600 });
-      fs.renameSync(temp, path);
-    }
-  ' "$docker_config" "$registry_mirror"
+  as_runner python3 - "$docker_config" "$registry_mirror" <<'PY'
+import json, os, sys
+from urllib.parse import urlsplit
+file, raw = sys.argv[1], sys.argv[2]
+parts = urlsplit(raw)
+if parts.scheme != "https" or parts.username or parts.password or parts.query or parts.fragment or parts.path not in ("", "/"):
+    raise SystemExit("registry mirror must be an HTTPS origin without credentials or a path")
+origin = f"{parts.scheme}://{parts.netloc}"
+with open(file, encoding="utf-8") as handle:
+    config = json.load(handle)
+mirrors = config.get("registry-mirrors", [])
+if not isinstance(mirrors, list) or any(not isinstance(value, str) for value in mirrors):
+    raise SystemExit("existing registry-mirrors must be an array of URLs")
+updated = [origin, *(value for value in mirrors if value != origin)]
+if updated != mirrors:
+    config["registry-mirrors"] = updated
+    temp = f"{file}.{os.getpid()}.tmp"
+    with open(temp, "w", encoding="utf-8") as handle:
+        json.dump(config, handle, indent=2)
+        handle.write("\n")
+    os.chmod(temp, 0o600)
+    os.replace(temp, file)
+PY
 fi
+docker_config_after=$(sha256sum "$docker_config" 2>/dev/null || true)
+[[ "$docker_config_before" == "$docker_config_after" ]] || docker_changed=1
 
-as_runner install -d -m 0755 \
-  "$runner_home/.config/systemd/user"
+as_runner install -d -m 0755 "$runner_home/.config/systemd/user"
 if [[ ! -f "$runner_home/.config/systemd/user/docker.service" ]]; then
   step 'installing rootless Docker for the dedicated account'
   as_runner dockerd-rootless-setuptool.sh install
+  docker_changed=1
 fi
 as_runner systemctl --user daemon-reload
 as_runner systemctl --user enable docker.service
-as_runner systemctl --user restart docker.service
+docker_active=0
+as_runner systemctl --user is-active --quiet docker.service && docker_active=1
+if ((docker_changed)) || ((!docker_active)); then
+  step 'restarting the dedicated rootless Docker for the pending configuration change'
+  as_runner systemctl --user restart docker.service
+fi
+docker_ready=0
+for attempt in {1..10}; do
+  if as_runner docker info --format '{{.CgroupVersion}}' >/dev/null 2>&1; then docker_ready=1; break; fi
+  sleep 2
+done
+((docker_ready)) || fail 'the dedicated rootless Docker did not become reachable'
 [[ "$(as_runner docker info --format '{{.CgroupVersion}}')" == 2 ]] ||
   fail 'rootless Docker is not using cgroup v2'
 [[ "$(as_runner docker info --format '{{.CgroupDriver}}')" == systemd ]] ||
@@ -470,70 +434,211 @@ security_options=$(as_runner docker info --format '{{json .SecurityOptions}}')
 [[ "$(as_runner docker info --format '{{if index .Runtimes "runsc"}}yes{{end}}')" == yes ]] ||
   fail 'rootless Docker has not registered runsc'
 if [[ -n "$registry_mirror" ]]; then
-  mirror_origin=$(env -i PATH=/usr/bin:/bin "$node_bin" -p 'new URL(process.argv[1]).origin' "$registry_mirror")
+  mirror_origin=$(python3 -c 'import sys; from urllib.parse import urlsplit; p=urlsplit(sys.argv[1]); print(f"{p.scheme}://{p.netloc}")' "$registry_mirror")
   [[ "$(as_runner docker info --format '{{json .RegistryConfig.Mirrors}}')" == *"$mirror_origin"* ]] ||
     fail 'rootless Docker did not load the configured registry mirror'
 fi
 
-image_version=$(as_runner docker image inspect --format '{{index .Config.Labels "io.qfli.terminal.toolchains"}}' \
-  "$sandbox_image" 2>/dev/null || true)
-image_user=$(as_runner docker image inspect --format '{{.Config.User}}' "$sandbox_image" 2>/dev/null || true)
-image_source=$(as_runner docker image inspect --format '{{index .Config.Labels "io.qfli.terminal.sandbox-source"}}' \
-  "$sandbox_image" 2>/dev/null || true)
-sandbox_fingerprint=$(
-  cd "$source_dir"
-  find sandbox -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -d " " -f1
-)
-if [[ "$image_version" != 2 || "$image_user" != 65533:65533 || \
-      "$image_source" != "$sandbox_fingerprint" ]]; then
-  step 'building the trusted sandbox image; this can take several minutes'
-  if ! as_runner timeout 300 docker pull "$base_image"; then
-    [[ "$base_image" == debian:trixie-slim ]] || fail 'the selected trusted base image could not be pulled'
-    step 'Docker Hub unavailable; trying the Google Docker Hub mirror'
-    base_image=mirror.gcr.io/library/debian:trixie-slim
-    as_runner timeout 300 docker pull "$base_image" || fail 'both official Debian image registries are unreachable'
+step 'recording the previous immutable image state'
+legacy_unit=0
+if [[ -f "$runner_home/.config/systemd/user/qfli-terminal.service" ]] && \
+   grep -q 'qfli-node' "$runner_home/.config/systemd/user/qfli-terminal.service"; then
+  legacy_unit=1
+fi
+previous_executor_id=''
+previous_service_ref=''
+if [[ -f "$project_dir/.env" ]]; then
+  previous_service_ref=$(read_env_value "$project_dir/.env" QFLI_TERMINAL_SERVICE_IMAGE)
+fi
+if [[ -f "$project_dir/docker-compose.yaml" ]]; then
+  previous_container=$(compose ps -q executor 2>/dev/null || true)
+  if [[ -n "$previous_container" ]]; then
+    previous_executor_id=$(as_runner docker inspect --format '{{.Image}}' "$previous_container" 2>/dev/null || true)
   fi
-  as_runner docker build --pull --progress=plain \
-    --label "io.qfli.terminal.sandbox-source=$sandbox_fingerprint" \
-    --build-arg "BASE_IMAGE=$base_image" \
-    --build-arg "DEBIAN_MIRROR=$debian_mirror" \
-    -t "$sandbox_image" "$source_dir/sandbox" ||
-    fail 'sandbox build failed; if Docker Hub is unreachable, rerun with --registry-mirror and your trusted HTTPS Docker Hub accelerator'
+fi
+previous_sandbox_ref=''
+if [[ -f "$project_dir/.env" ]]; then
+  previous_sandbox_ref=$(read_env_value "$project_dir/.env" QFLI_TERMINAL_IMAGE)
+elif [[ -f "$legacy_env" ]]; then
+  previous_sandbox_ref=$(read_env_value "$legacy_env" QFLI_TERMINAL_IMAGE)
+fi
+previous_sandbox_id=''
+if [[ -n "$previous_sandbox_ref" ]]; then
+  previous_sandbox_id=$(as_runner docker image inspect --format '{{.Id}}' "$previous_sandbox_ref" 2>/dev/null || true)
+fi
+if [[ -n "$previous_executor_id" || -n "$previous_sandbox_id" ]]; then
+  as_runner install -d -m 0700 "$backup_dir"
+  printf '{"executorId":"%s","sandboxId":"%s"}\n' "$previous_executor_id" "$previous_sandbox_id" |
+    as_runner sh -c 'umask 077; cat > "$1"' sh "$backup_dir/images.previous.json"
 fi
 
-step 'configuring the executor user service'
-config_dir="$runner_home/.config/qfli-terminal"
-as_runner install -d -m 0700 "$config_dir"
-printf 'QFLI_TERMINAL_SECRET=%s\nQFLI_TERMINAL_IMAGE=%s\n' \
-  "$secret" "$sandbox_image" | as_runner sh -c '
-      set -eu
-      temp_env=$(mktemp "$HOME/.config/qfli-terminal/runner.env.XXXXXXXX")
-      trap "rm -f -- \"$temp_env\"" EXIT
-      cat > "$temp_env"
-      chmod 0600 "$temp_env"
-      mv -T -- "$temp_env" "$HOME/.config/qfli-terminal/runner.env"
-    '
-as_runner chmod 0600 "$runner_env"
+step 'pulling the prebuilt sandbox and executor images'
+as_runner docker pull "$sandbox_image"
+as_runner docker pull "$executor_image"
+as_runner docker image inspect -- "$executor_image" >/dev/null ||
+  fail 'the executor image could not be pulled'
+
+sandbox_user=$(as_runner docker image inspect --format '{{.Config.User}}' "$sandbox_image")
+sandbox_label=$(as_runner docker image inspect --format '{{index .Config.Labels "io.qfli.terminal.image"}}' "$sandbox_image")
+sandbox_toolchains=$(as_runner docker image inspect --format '{{index .Config.Labels "io.qfli.terminal.toolchains"}}' "$sandbox_image")
+sandbox_entry=$(as_runner docker image inspect --format '{{json .Config.Entrypoint}}' "$sandbox_image")
+sandbox_cmd=$(as_runner docker image inspect --format '{{len .Config.Cmd}}' "$sandbox_image")
+sandbox_volumes=$(as_runner docker image inspect --format '{{len .Config.Volumes}}' "$sandbox_image")
+expected_entry='["/usr/bin/python3","-I","/usr/local/lib/qfli/init.py"]'
+[[ "$sandbox_label" == 1 && "$sandbox_toolchains" == 3 && "$sandbox_user" == 65533:65533 &&
+   "$sandbox_entry" == "$expected_entry" && "$sandbox_cmd" == 0 && "$sandbox_volumes" == 0 ]] ||
+  fail "sandbox image contract mismatch: $sandbox_image"
+
+sandbox_id=$(as_runner docker image inspect --format '{{.Id}}' "$sandbox_image")
+executor_id=$(as_runner docker image inspect --format '{{.Id}}' "$executor_image")
+[[ "$sandbox_id" =~ ^sha256:[a-f0-9]{64}$ && "$executor_id" =~ ^sha256:[a-f0-9]{64}$ ]] ||
+  fail 'pulled images do not expose immutable IDs'
+
+# An unchanged rerun must not restart Docker or replace running sandboxes.
+desired_env=$(printf 'QFLI_TERMINAL_SECRET=%s\nQFLI_TERMINAL_IMAGE=%s\nQFLI_TERMINAL_SERVICE_IMAGE=%s\nQFLI_RUNNER_HOST_UID=%s' \
+  "$secret" "$sandbox_image" "$executor_image" "$runner_uid")
+current_env=$(cat "$project_dir/.env" 2>/dev/null || true)
+current_receipt=$(cat "$installed_receipt" 2>/dev/null || true)
+if [[ -f "$project_dir/.env" && -f "$project_dir/docker-compose.yaml" ]] && \
+   cmp -s "$release_source/docker-compose.yaml" "$project_dir/docker-compose.yaml" && \
+   [[ "$current_env" == "$desired_env" ]] && \
+   [[ "$current_receipt" == *"\"sandboxId\":\"$sandbox_id\""* ]] && \
+   [[ "$current_receipt" == *"\"executorId\":\"$executor_id\""* ]] && \
+   compose exec -T executor node deployment/check-health.mjs >/dev/null 2>&1; then
+  step 'installed images, compose file and secret already match; nothing to change'
+  compose exec -T executor node deployment/check-health.mjs
+  exit 0
+fi
+
+# Preserve the previous stack so a failed release can be restored.
+previous_env=''
+previous_compose=''
+as_runner install -d -m 0700 "$backup_dir"
+if [[ -f "$project_dir/.env" ]]; then
+  as_runner install -m 0600 "$project_dir/.env" "$backup_dir/env.previous"
+  previous_env="$backup_dir/env.previous"
+fi
+if [[ -f "$project_dir/docker-compose.yaml" ]]; then
+  as_runner install -m 0644 "$project_dir/docker-compose.yaml" "$backup_dir/docker-compose.previous.yaml"
+  previous_compose="$backup_dir/docker-compose.previous.yaml"
+fi
+
+stack_was_running=0
+if [[ -f "$project_dir/docker-compose.yaml" ]] && \
+   [[ -n "$(compose ps -q 2>/dev/null || true)" ]]; then
+  stack_was_running=1
+fi
+
+restore_previous() {
+  if [[ -n "$previous_env" ]]; then
+    step 'restoring the previous image stack pinned to its immutable image IDs'
+    if [[ -n "$previous_executor_id" || -n "$previous_sandbox_id" ]]; then
+      pinned_service=${previous_executor_id:-$(read_env_value "$previous_env" QFLI_TERMINAL_SERVICE_IMAGE)}
+      pinned_sandbox=${previous_sandbox_id:-$(read_env_value "$previous_env" QFLI_TERMINAL_IMAGE)}
+      {
+        grep -v -E '^(QFLI_TERMINAL_SERVICE_IMAGE|QFLI_TERMINAL_IMAGE)=' "$previous_env" || true
+        printf 'QFLI_TERMINAL_SERVICE_IMAGE=%s\nQFLI_TERMINAL_IMAGE=%s\n' "$pinned_service" "$pinned_sandbox"
+      } | as_runner sh -c '
+        set -eu
+        umask 077
+        temp=$(mktemp "$1/.env.XXXXXXXX")
+        trap "rm -f -- \"$temp\"" EXIT
+        cat > "$temp"
+        chmod 0600 "$temp"
+        mv -T -- "$temp" "$1/.env"
+      ' sh "$project_dir"
+    else
+      as_runner install -m 0600 "$previous_env" "$project_dir/.env"
+    fi
+    [[ -z "$previous_compose" ]] || as_runner install -m 0644 "$previous_compose" "$project_dir/docker-compose.yaml"
+    compose up -d --remove-orphans || true
+  elif ((legacy_unit)); then
+    step 'restoring the previous host-service executor with its immutable sandbox image'
+    if [[ -n "$previous_sandbox_id" ]]; then
+      as_runner install -m 0600 "$legacy_env" "$backup_dir/runner.env.previous"
+      {
+        grep -v '^QFLI_TERMINAL_IMAGE=' "$legacy_env" || true
+        printf 'QFLI_TERMINAL_IMAGE=%s\n' "$previous_sandbox_id"
+      } | as_runner sh -c '
+        set -eu
+        umask 077
+        temp=$(mktemp "$1.XXXXXXXX")
+        trap "rm -f -- \"$temp\"" EXIT
+        cat > "$temp"
+        chmod 0600 "$temp"
+        mv -T -- "$temp" "$1"
+      ' sh "$legacy_env"
+    fi
+    as_runner systemctl --user enable --now qfli-terminal.service || true
+  else
+    step 'no previous executor stack exists; leaving the new stack stopped'
+  fi
+}
+
+step 'stopping the previous executor'
+if ((stack_was_running)); then
+  compose down --remove-orphans || fail 'the previous image stack did not stop cleanly'
+fi
+if ((legacy_unit)) && as_runner systemctl --user is-active --quiet qfli-terminal.service; then
+  as_runner systemctl --user disable --now qfli-terminal.service
+fi
+
+printf 'QFLI_TERMINAL_SECRET=%s\nQFLI_TERMINAL_IMAGE=%s\nQFLI_TERMINAL_SERVICE_IMAGE=%s\nQFLI_RUNNER_HOST_UID=%s\n' \
+  "$secret" "$sandbox_image" "$executor_image" "$runner_uid" |
+  as_runner sh -c '
+    set -eu
+    umask 077
+    temp=$(mktemp "$1/.env.XXXXXXXX")
+    trap "rm -f -- \"$temp\"" EXIT
+    cat > "$temp"
+    chmod 0600 "$temp"
+    mv -T -- "$temp" "$1/.env"
+  ' sh "$project_dir"
+as_runner install -m 0644 "$release_source/docker-compose.yaml" "$project_dir/docker-compose.yaml"
 unset secret
+
 step 'verifying all toolchains in actual bounded gVisor sessions'
-as_runner "$node_bin" --env-file="$runner_env" "$source_dir/deployment/verify-runtime.mjs" ||
-  fail 'runtime/toolchain verification failed; executor remains stopped'
-as_runner install -m 0644 \
-  "$source_dir/deployment/qfli-terminal.service" \
-  "$runner_home/.config/systemd/user/qfli-terminal.service"
-as_runner systemctl --user daemon-reload
-as_runner systemctl --user enable --now qfli-terminal.service
+if ! compose run --rm --no-deps --entrypoint node executor deployment/verify-runtime.mjs; then
+  restore_previous
+  fail 'runtime/toolchain verification failed; the previous stack was restored'
+fi
+
+step 'starting the executor and updater stack'
+compose up -d --remove-orphans || { restore_previous; fail 'the executor stack failed to start'; }
 
 step 'waiting for the authenticated local health check'
-for attempt in {1..10}; do
-  if as_runner "$node_bin" "$source_dir/deployment/check-health.mjs" >/dev/null 2>&1; then
-    as_runner "$node_bin" "$source_dir/deployment/check-health.mjs"
-    printf '%s\n' "$source_fingerprint" | as_runner sh -c 'umask 077; cat > "$1"' sh "$receipt"
-    printf 'QFLI terminal setup: installed and enabled at boot\n'
-    exit 0
+healthy=0
+for attempt in {1..15}; do
+  if compose exec -T executor node deployment/check-health.mjs >/dev/null 2>&1; then
+    compose exec -T executor node deployment/check-health.mjs
+    healthy=1
+    break
   fi
   sleep 2
 done
-as_runner journalctl --user -u qfli-terminal.service -n 80 --no-pager || true
-as_runner systemctl --user disable --now qfli-terminal.service
-fail 'the executor did not become healthy; inspect the service log above'
+if ((!healthy)); then
+  compose logs --tail=80 executor || true
+  compose down --remove-orphans || true
+  restore_previous
+  fail 'the executor did not become healthy; the previous stack was restored'
+fi
+
+if ((legacy_unit)); then
+  as_runner cp -p "$runner_home/.config/systemd/user/qfli-terminal.service" \
+    "$runner_home/.config/systemd/user/qfli-terminal.service.legacy"
+fi
+as_runner install -m 0644 "$release_source/deployment/qfli-terminal-compose.service" \
+  "$runner_home/.config/systemd/user/qfli-terminal.service"
+as_runner systemctl --user daemon-reload
+as_runner systemctl --user enable qfli-terminal.service
+
+fingerprint=$(sha256sum "$project_dir/docker-compose.yaml" | cut -d ' ' -f1)
+printf '{"executorImage":"%s","executorId":"%s","sandboxImage":"%s","sandboxId":"%s","composeSha256":"%s","verifiedAt":"%s"}\n' \
+  "$executor_image" "$executor_id" "$sandbox_image" "$sandbox_id" "$fingerprint" \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" |
+  as_runner sh -c 'umask 077; cat > "$1"' sh "$installed_receipt"
+if [[ "$release_source" != "$project_dir" ]]; then
+  as_runner install -m 0644 "$release_source/.env.example" "$project_dir/.env.example"
+fi
+
+printf 'QFLI terminal setup: installed, verified and enabled at boot\n'
