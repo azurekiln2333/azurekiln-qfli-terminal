@@ -12,37 +12,35 @@ business_env=$(realpath -- "$2")
 runner=qfli-runner
 runner_uid=$(id -u "$runner")
 runner_home=$(getent passwd "$runner" | cut -d: -f6)
-installed="$runner_home/azurekiln-qfli-terminal"
+project_dir="$runner_home/qfli-terminal"
 runner_env="$runner_home/.config/qfli-terminal/runner.env"
 as_runner() {
-  runuser -u "$runner" -- env -i HOME="$runner_home" USER="$runner" LOGNAME="$runner" \
-    PATH=/usr/local/bin:/usr/bin:/bin XDG_RUNTIME_DIR="/run/user/$runner_uid" \
-    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$runner_uid/bus" \
-    DOCKER_HOST="unix:///run/user/$runner_uid/docker.sock" "$@"
+  (
+    cd "$runner_home" || exit
+    exec runuser -u "$runner" -- env -i HOME="$runner_home" USER="$runner" LOGNAME="$runner" \
+      PATH=/usr/local/bin:/usr/bin:/bin XDG_RUNTIME_DIR="/run/user/$runner_uid" \
+      DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$runner_uid/bus" \
+      DOCKER_HOST="unix:///run/user/$runner_uid/docker.sock" "$@"
+  )
 }
-as_runner /usr/local/bin/qfli-node "$installed/deployment/check-health.mjs"
+compose() {
+  as_runner docker compose --project-directory "$project_dir" "$@"
+}
+compose exec -T executor node deployment/check-health.mjs
 as_runner systemctl --user is-enabled --quiet docker.service qfli-terminal.service
+
 stage=$(mktemp -d /var/tmp/qfli-bootstrap-test.XXXXXXXX)
-docs_owner=$(stat -c '%u:%g' "$installed/docs")
-docs_mode=$(stat -c '%a' "$installed/docs")
-marker="$installed/test/.bootstrap-upgrade-test-$$"
+marker="$project_dir/.bootstrap-upgrade-test-$$"
 cleanup() {
-  chown "$docs_owner" "$installed/docs"
-  chmod "$docs_mode" "$installed/docs"
   rm -f -- "$marker"
-  for entry in README.md docs/runtime-validation.md; do
-    if [[ -f "$stage/source/$entry" ]]; then
-      cat "$stage/source/$entry" | as_runner tee "$installed/$entry" >/dev/null
-    fi
-  done
   [[ "$stage" == /var/tmp/qfli-bootstrap-test.* ]] && rm -rf -- "$stage"
 }
 trap cleanup EXIT
 install -m 0700 "$release_source/deployment/bootstrap.sh" "$stage/bootstrap.sh"
 mkdir "$stage/source"
-tar -C "$release_source" -cf - src sandbox deployment test docs package.json README.md .env.example |
+tar -C "$release_source" -cf - docker-compose.yaml .env.example deployment |
   tar -C "$stage/source" -xf -
-cp "$runner_env" "$stage/runner.env.before"
+cp "$project_dir/.env" "$stage/env.before"
 
 service_state() {
   as_runner systemctl --user show docker.service qfli-terminal.service \
@@ -58,39 +56,28 @@ expect_preflight_failure() {
   grep -Fq -- "$expected" "$stage/output.log" || { cat "$stage/output.log"; exit 1; }
   after=$(service_state)
   [[ "$before" == "$after" ]] || { printf 'FAIL preflight changed services: %s\n' "$label" >&2; exit 1; }
-  cmp -s "$stage/runner.env.before" "$runner_env"
+  cmp -s "$stage/env.before" "$project_dir/.env"
   printf 'PASS %s rejected with both services unchanged\n' "$label"
 }
 
-chown root:root "$installed/docs"
-chmod 0777 "$installed/docs"
-expect_preflight_failure 'writable root-owned directory' "release overwrite blocked at $installed/docs"
-chown "$docs_owner" "$installed/docs"
-chmod "$docs_mode" "$installed/docs"
 install -m 0644 /dev/null "$marker"
-expect_preflight_failure 'root-owned nested file' "release overwrite blocked at $marker"
-chown "$runner_uid" "$marker"
-chmod 0400 "$marker"
-expect_preflight_failure 'runner-owned read-only file' "release overwrite blocked at $marker"
+expect_preflight_failure 'root-owned nested file' "compose project path is not writable by $runner"
 rm -f -- "$marker"
-ln -s "$stage/source/README.md" "$marker"
-expect_preflight_failure 'nested destination symlink' "release overwrite blocked at $marker"
+ln -s "$stage/source/docker-compose.yaml" "$marker"
+expect_preflight_failure 'nested destination symlink' "compose project path is not writable by $runner"
 rm -f -- "$marker"
-for entry in docs test; do
-  mv "$stage/source/$entry" "$stage/$entry.saved"
-  expect_preflight_failure "missing $entry source" "source directory is incomplete: missing $stage/source/$entry"
-  mv "$stage/$entry.saved" "$stage/source/$entry"
-done
-as_runner /usr/local/bin/qfli-node "$installed/deployment/check-health.mjs"
+mv "$stage/source/docker-compose.yaml" "$stage/docker-compose.saved"
+expect_preflight_failure 'missing compose source' "source is incomplete: missing $stage/source/docker-compose.yaml"
+mv "$stage/docker-compose.saved" "$stage/source/docker-compose.yaml"
 
-for entry in README.md docs/runtime-validation.md; do
-  as_runner sh -c 'printf "%s\n" stale-upgrade-fixture > "$1"' sh "$installed/$entry"
+for entry in docker-compose.yaml .env.example; do
+  as_runner sh -c 'printf "%s\n" stale-upgrade-fixture > "$1"' sh "$project_dir/$entry"
 done
 bash "$stage/bootstrap.sh" --source-dir "$stage/source" --business-env "$business_env"
-cmp -s "$stage/source/README.md" "$installed/README.md"
-cmp -s "$stage/source/docs/runtime-validation.md" "$installed/docs/runtime-validation.md"
-cmp -s "$stage/runner.env.before" "$runner_env"
-printf 'PASS upgrade overwrote managed files and preserved runner credentials\n'
+cmp -s "$stage/source/docker-compose.yaml" "$project_dir/docker-compose.yaml"
+cmp -s "$stage/env.before" "$project_dir/.env"
+compose exec -T executor node deployment/check-health.mjs
+printf 'PASS upgrade overwrote the managed compose file and preserved the secret\n'
 before=$(service_state)
 bash "$stage/bootstrap.sh" --source-dir "$stage/source" --business-env "$business_env"
 [[ "$before" == "$(service_state)" ]]
