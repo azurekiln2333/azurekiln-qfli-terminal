@@ -1,0 +1,100 @@
+# GitHub Actions. Validation and publishing share scripts/ci-common.mjs with
+# CNB and GitLab CI, so every platform runs identical checks and tag rules.
+#
+# Images go to GHCR under the repository owner:
+#   Executor: ghcr.io/<owner>/azurekiln-qfli-terminal
+#   Sandbox:  ghcr.io/<owner>/azurekiln-qfli-terminal/sandbox
+# GITHUB_TOKEN needs `packages: write`; no extra secret is required.
+# Pull requests validate only; they never log in or push images.
+name: Verify and publish images
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24.15.0"
+      # Keep Compose CLI available on the runner for deployment verification.
+      - name: Require Compose
+        run: docker compose version --short
+      - name: Validate
+        run: node scripts/ci-common.mjs verify
+
+  image:
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    needs: verify
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24.15.0"
+      - name: Log in to GHCR
+        run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Re-run validation before publishing
+        run: node scripts/ci-common.mjs verify
+      - name: Build, smoke-test and push executor image
+        run: >-
+          node scripts/ci-common.mjs publish
+          --platform github
+          --ref "${{ github.ref }}"
+          --revision "${{ github.sha }}"
+          --repository "${{ github.repository }}"
+          --target executor
+          --no-login
+          --steps build
+      - name: Promote executor latest tag
+        run: >-
+          node scripts/ci-common.mjs publish
+          --platform github
+          --ref "${{ github.ref }}"
+          --revision "${{ github.sha }}"
+          --repository "${{ github.repository }}"
+          --target executor
+          --no-login
+          --steps push
+      - name: Build, smoke-test and push sandbox image
+        run: >-
+          node scripts/ci-common.mjs publish
+          --platform github
+          --ref "${{ github.ref }}"
+          --revision "${{ github.sha }}"
+          --repository "${{ github.repository }}"
+          --target sandbox
+          --no-login
+          --steps build
+      - name: Promote sandbox channel and latest tags
+        run: >-
+          node scripts/ci-common.mjs publish
+          --platform github
+          --ref "${{ github.ref }}"
+          --revision "${{ github.sha }}"
+          --repository "${{ github.repository }}"
+          --target sandbox
+          --no-login
+          --steps push

@@ -1,9 +1,15 @@
-# CI for the standalone executor repository.
+# CI for the standalone terminal executor repository.
+# Validation and publishing both live in scripts/ci-common.mjs, so CNB,
+# GitHub Actions and GitLab CI stay aligned.
+#
 # Images are namespaced by this repository's CNB slug:
-#   docker.cnb.cool/${CNB_REPO_SLUG_LOWERCASE}/qfli-terminal
-#   docker.cnb.cool/${CNB_REPO_SLUG_LOWERCASE}/qfli-terminal-sandbox
-# `services: [docker]` logs in automatically on trusted push/tag pipelines.
-# Pull-request pipelines are read-only and never push images.
+#   Executor: docker.cnb.cool/${CNB_REPO_SLUG_LOWERCASE}
+#   Sandbox:  docker.cnb.cool/${CNB_REPO_SLUG_LOWERCASE}/sandbox
+#
+# Every job here runs Node, so every job pins node:24.15.0-bookworm.
+# `services: [docker]` logs in to docker.cnb.cool automatically on trusted
+# push/tag pipelines, so publish steps pass --no-login.
+# Pull requests validate only; they never push images.
 
 main:
   push:
@@ -12,102 +18,41 @@ main:
         image: node:24.15.0-bookworm
       stages:
         - name: unit-tests
-          script: |
-            set -euo pipefail
-            node --version
-            npm test
-            for script in deployment/bootstrap.sh test/bootstrap-upgrade.sh; do
-              bash -n "$script"
-            done
-            python3 -m py_compile sandbox/init.py sandbox/cleanup.py \
-              sandbox/ready.py sandbox/snapshot.py deployment/smoke-isolation.py
+          script: node scripts/ci-common.mjs verify
+
     - name: publish-images
-      docker:
-        image: cnbcool/default-dev-env:latest
+      docker: *node-runtime
       services:
         - docker
       stages:
         - name: build-and-push
-          script: |
-            set -euo pipefail
-            # Validate before publishing: a failing test must block the image.
-            command -v node >/dev/null || { echo 'node is required in the publish image' >&2; exit 1; }
-            node --test test/*.test.js
-            REGISTRY="${CNB_REGISTRY:-docker.cnb.cool}"
-            SLUG="${CNB_REPO_SLUG_LOWERCASE:?CNB_REPO_SLUG_LOWERCASE is not set}"
-            EXECUTOR_IMAGE="${CNB_EXECUTOR_IMAGE:-$REGISTRY/$SLUG/qfli-terminal}"
-            SANDBOX_IMAGE="${CNB_SANDBOX_IMAGE:-$REGISTRY/$SLUG/qfli-terminal-sandbox}"
-            REVISION="${CNB_COMMIT_SHORT:-$(git rev-parse --short HEAD)}"
-            if [ -n "${CNB_REGISTRY_PASSWORD:-}" ]; then
-              printf '%s' "$CNB_REGISTRY_PASSWORD" |
-                docker login "$REGISTRY" -u "${CNB_REGISTRY_USER:-cnb}" --password-stdin
-            fi
-            docker build --pull -t "$EXECUTOR_IMAGE:$REVISION" .
-            docker build --pull -f sandbox/Dockerfile -t "$SANDBOX_IMAGE:3" sandbox
-            docker push "$EXECUTOR_IMAGE:$REVISION"
-            docker push "$SANDBOX_IMAGE:3"
-            docker tag "$EXECUTOR_IMAGE:$REVISION" "$EXECUTOR_IMAGE:latest"
-            docker tag "$SANDBOX_IMAGE:3" "$SANDBOX_IMAGE:latest"
-            docker push "$EXECUTOR_IMAGE:latest"
-            docker push "$SANDBOX_IMAGE:latest"
-            printf 'published %s:%s %s:3 %s:latest\n' \
-              "$EXECUTOR_IMAGE" "$REVISION" "$SANDBOX_IMAGE" "$EXECUTOR_IMAGE"
-            docker image inspect --format 'sandbox digest {{index .RepoDigests 0}}' \
-              "$SANDBOX_IMAGE:3" || true
+          script: >-
+            node scripts/ci-common.mjs publish
+            --platform cnb
+            --ref "refs/heads/${CNB_BRANCH}"
+            --revision "$CNB_COMMIT"
+            --repository "$CNB_REPO_SLUG_LOWERCASE"
+            --no-login
 
   pull_request:
     - name: verify-pull-request
       docker: *node-runtime
       stages:
         - name: unit-tests
-          script: |
-            set -euo pipefail
-            npm test
-            for script in deployment/bootstrap.sh test/bootstrap-upgrade.sh; do
-              bash -n "$script"
-            done
-            python3 -m py_compile sandbox/init.py sandbox/cleanup.py \
-              sandbox/ready.py sandbox/snapshot.py deployment/smoke-isolation.py
+          script: node scripts/ci-common.mjs verify
 
 "v*":
   tag_push:
     - name: publish-release-images
-      docker:
-        image: cnbcool/default-dev-env:latest
+      docker: *node-runtime
       services:
         - docker
       stages:
         - name: build-and-push-tag
-          script: |
-            set -euo pipefail
-            command -v node >/dev/null || { echo 'node is required in the publish image' >&2; exit 1; }
-            node --test test/*.test.js
-            REGISTRY="${CNB_REGISTRY:-docker.cnb.cool}"
-            SLUG="${CNB_REPO_SLUG_LOWERCASE:?CNB_REPO_SLUG_LOWERCASE is not set}"
-            EXECUTOR_IMAGE="${CNB_EXECUTOR_IMAGE:-$REGISTRY/$SLUG/qfli-terminal}"
-            SANDBOX_IMAGE="${CNB_SANDBOX_IMAGE:-$REGISTRY/$SLUG/qfli-terminal-sandbox}"
-            TAG="${CNB_BRANCH:?CNB_BRANCH is not set}"
-            VERSION="${TAG#v}"
-            STABLE=0
-            case "$VERSION" in
-              *-*) echo "prerelease $VERSION, stable tags stay unchanged" ;;
-              *) STABLE=1 ;;
-            esac
-            if [ -n "${CNB_REGISTRY_PASSWORD:-}" ]; then
-              printf '%s' "$CNB_REGISTRY_PASSWORD" |
-                docker login "$REGISTRY" -u "${CNB_REGISTRY_USER:-cnb}" --password-stdin
-            fi
-            docker build --pull -t "$EXECUTOR_IMAGE:$TAG" .
-            docker push "$EXECUTOR_IMAGE:$TAG"
-            if [ "$STABLE" = 1 ]; then
-              docker build --pull -f sandbox/Dockerfile -t "$SANDBOX_IMAGE:3" sandbox
-              docker push "$SANDBOX_IMAGE:3"
-              docker tag "$EXECUTOR_IMAGE:$TAG" "$EXECUTOR_IMAGE:latest"
-              docker push "$EXECUTOR_IMAGE:latest"
-              docker tag "$SANDBOX_IMAGE:3" "$SANDBOX_IMAGE:latest"
-              docker push "$SANDBOX_IMAGE:latest"
-            else
-              docker build --pull -f sandbox/Dockerfile -t "$SANDBOX_IMAGE:$TAG-sandbox" sandbox
-              docker push "$SANDBOX_IMAGE:$TAG-sandbox"
-            fi
-            printf 'published %s:%s (stable=%s)\n' "$EXECUTOR_IMAGE" "$TAG" "$STABLE"
+          script: >-
+            node scripts/ci-common.mjs publish
+            --platform cnb
+            --ref "refs/tags/${CNB_BRANCH}"
+            --revision "$CNB_COMMIT"
+            --repository "$CNB_REPO_SLUG_LOWERCASE"
+            --no-login

@@ -11,8 +11,8 @@ runner=qfli-runner
 business_env=''
 input_source=''
 registry_mirror=''
-sandbox_image=docker.cnb.cool/azurekiln/qflistudio-next/qfli-terminal-sandbox:3
-executor_image=docker.cnb.cool/azurekiln/qflistudio-next/qfli-terminal:latest
+sandbox_image=docker.cnb.cool/azurekiln/azurekiln-qfli-terminal/sandbox:3
+executor_image=docker.cnb.cool/azurekiln/azurekiln-qfli-terminal:latest
 sandbox_image_set=0
 release_entries=(docker-compose.yaml .env.example deployment/docker-daemon.json \
   deployment/qfli-terminal-compose.service deployment/check-health.mjs \

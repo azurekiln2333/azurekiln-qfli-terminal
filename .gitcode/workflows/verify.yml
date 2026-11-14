@@ -1,0 +1,22 @@
+# AtomGit (gitcode.com) Action pipeline.
+# Validation only; see deploy/ci-platforms.md.
+name: Verify
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  repository: read
+
+jobs:
+  verify:
+    name: verify
+    runs-on: [ubuntu-latest, x64, small]
+    steps:
+      - name: Check out
+        uses: checkout
+      - name: Validate
+        run: node scripts/ci-common.mjs verify

@@ -286,25 +286,36 @@ docker info
 
 ### 4. 拉取预构建镜像
 
-CI 在可信流水线构建执行器镜像和沙箱镜像。生产服务器只拉取镜像。生产服务器不构建服务，也不构建工具链。
+CI 在可信流水线构建执行器镜像与沙箱镜像。生产服务器只拉取镜像。生产服务器不构建服务，也不构建工具链。
 
-镜像路径以所在 CNB 仓库为命名空间：
+校验与发布逻辑统一放在 `scripts/ci-common.mjs`。各平台镜像命名如下（详情见 [ci-platforms.md](deploy/ci-platforms.md)）：
 
-```text
-docker.cnb.cool/<仓库路径>/qfli-terminal
-docker.cnb.cool/<仓库路径>/qfli-terminal-sandbox
-```
+| 平台 | 执行器镜像 | 沙箱镜像 | 配置文件 |
+| --- | --- | --- | --- |
+| CNB | `docker.cnb.cool/azurekiln/azurekiln-qfli-terminal` | `.../sandbox` | `.cnb.yml` |
+| GitHub Actions | `ghcr.io/azurekiln2333/azurekiln-qfli-terminal` | `.../sandbox` | `.github/workflows/build-and-push.yml` |
+| GitLab CI | `registry.gitlab.com/azurekiln-team/azurekiln-qfli-terminal` | `.../sandbox` | `.gitlab-ci.yml` |
+| GitCode / AtomGit | 只跑校验，不推镜像 | 无 | `.gitcode/workflows/verify.yml` |
+| Gitee | 无工作流 | 无 | 无 |
 
-默认仓库路径是 `azurekiln/qflistudio-next`。执行器仓库独立发布时，把路径换成它自己的 CNB 仓库路径。
-
-安装器参数示例：
+默认安装器参数对应 CNB 镜像：
 
 ```sh
 bash /root/qfli-terminal-bootstrap.sh \
   --source-dir /实际上传目录/azurekiln-qfli-terminal \
   --business-env /实际业务后端目录/.env \
-  --executor-image docker.cnb.cool/azurekiln/qflistudio-next/qfli-terminal:latest \
-  --sandbox-image docker.cnb.cool/azurekiln/qflistudio-next/qfli-terminal-sandbox:3
+  --executor-image docker.cnb.cool/azurekiln/azurekiln-qfli-terminal:latest \
+  --sandbox-image docker.cnb.cool/azurekiln/azurekiln-qfli-terminal/sandbox:3
+```
+
+从 GitHub Container Registry 拉取：
+
+```sh
+bash /root/qfli-terminal-bootstrap.sh \
+  --source-dir /实际上传目录/azurekiln-qfli-terminal \
+  --business-env /实际业务后端目录/.env \
+  --executor-image ghcr.io/azurekiln2333/azurekiln-qfli-terminal:latest \
+  --sandbox-image ghcr.io/azurekiln2333/azurekiln-qfli-terminal/sandbox:3
 ```
 
 生产环境建议用 digest 固定沙箱镜像。例如 `--sandbox-image ...@sha256:<审核后的digest>`。

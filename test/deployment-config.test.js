@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { imagePlan } from '../scripts/ci-common.mjs';
 
 const read = path => readFileSync(new URL(`../${path}`, import.meta.url), 'utf8');
 
@@ -111,11 +112,25 @@ test('rollback pins the previous immutable image IDs recorded before the pull', 
 
 test('prerelease tags never move latest or the stable sandbox tag', () => {
   const ci = read('.cnb.yml');
-  assert.match(ci, /case "\$VERSION" in\s*\n\s*\*-\*\)/);
-  assert.match(ci, /if \[ "\$STABLE" = 1 \]; then/);
-  const tagStage = ci.slice(ci.indexOf('build-and-push-tag'));
-  assert.ok(tagStage.indexOf('$SANDBOX_IMAGE:3') > tagStage.indexOf('if [ "$STABLE" = 1 ]'),
-    'the stable sandbox tag is only pushed inside the stable branch');
+  assert.match(ci, /scripts\/ci-common\.mjs publish[\s\S]*--ref "refs\/tags\/\$\{CNB_BRANCH\}"/);
+  const pre = imagePlan({
+    platform: 'cnb',
+    repository: 'azurekiln/azurekiln-qfli-terminal',
+    ref: 'refs/tags/v1.0.0-rc.1',
+    revision: 'a1b2c3d4e5f6',
+  });
+  assert.equal(pre.latest, false);
+  assert.equal(pre.sandboxChannel, null);
+  assert.equal(pre.sandboxTag, 'v1.0.0-rc.1-sandbox');
+
+  const stable = imagePlan({
+    platform: 'cnb',
+    repository: 'azurekiln/azurekiln-qfli-terminal',
+    ref: 'refs/tags/v1.0.0',
+    revision: 'a1b2c3d4e5f6',
+  });
+  assert.equal(stable.latest, true);
+  assert.equal(stable.sandboxChannel, '3');
 });
 
 test('installed release keeps every deployment file the rerun needs', () => {

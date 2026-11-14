@@ -2,3 +2,5 @@
 node_modules/
 *.log
 azurekiln-qfli-terminal.zip
+__pycache__/
+*.pyc

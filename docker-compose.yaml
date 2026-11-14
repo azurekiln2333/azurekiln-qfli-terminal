@@ -6,7 +6,7 @@
 # no depends_on, independent restart and independent watchtower scope.
 services:
   executor:
-    image: "${QFLI_TERMINAL_SERVICE_IMAGE:-docker.cnb.cool/azurekiln/qflistudio-next/qfli-terminal}"
+    image: "${QFLI_TERMINAL_SERVICE_IMAGE:-docker.cnb.cool/azurekiln/azurekiln-qfli-terminal:latest}"
     restart: unless-stopped
     init: true
     pid: host
