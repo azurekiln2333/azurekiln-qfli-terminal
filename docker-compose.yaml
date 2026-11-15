@@ -4,6 +4,11 @@
 #
 # Requires QFLI_RUNNER_HOST_UID (see .env.example). Both services are separate:
 # no depends_on, independent restart and independent watchtower scope.
+#
+# QFLI_TERMINAL_HOST_PORT moves only the loopback host port; the executor keeps
+# listening on the fixed container port 3101 and the business URL stays
+# http://127.0.0.1:<QFLI_TERMINAL_HOST_PORT>.
+# The updater is optional: it starts only with COMPOSE_PROFILES=auto-update.
 services:
   executor:
     image: "${QFLI_TERMINAL_SERVICE_IMAGE:-docker.cnb.cool/azurekiln/azurekiln-qfli-terminal:latest}"
@@ -22,7 +27,8 @@ services:
       QFLI_TERMINAL_CGROUP_ROOT: /host/cgroup
       HOME: /run/user/${QFLI_RUNNER_HOST_UID}
     ports:
-      - "127.0.0.1:3101:3101"
+      # Loopback only. The host port is configurable; the container port is not.
+      - "127.0.0.1:${QFLI_TERMINAL_HOST_PORT:-3101}:3101"
     volumes:
       # Dedicated rootless engine socket plus executor create journal.
       - "/run/user/${QFLI_RUNNER_HOST_UID}:/run/user/${QFLI_RUNNER_HOST_UID}"
@@ -54,9 +60,12 @@ services:
       retries: 3
 
   # Independent updater for the executor image only. It uses the dedicated
-  # rootless socket, never the host root Docker socket.
+  # rootless socket, never the host root Docker socket. It is optional: with no
+  # COMPOSE_PROFILES=auto-update the stack runs the executor alone.
   watchtower:
     image: "${QFLI_TERMINAL_WATCHTOWER_IMAGE:-nickfedor/watchtower:1.23.2}"
+    profiles:
+      - auto-update
     restart: unless-stopped
     environment:
       WATCHTOWER_LABEL_ENABLE: "true"

@@ -39,6 +39,16 @@ check(!/^\s+depends_on:/m.test(compose), 'production compose must not declare de
 check(/^\s+build:/m.test(buildCompose), 'docker-compose.build.yaml must contain the development build override');
 check(/start_period:/.test(compose) && !/start-period:/.test(compose), 'compose must use start_period');
 check(/com\.centurylinklabs\.watchtower\.scope: qfli-terminal/.test(compose), 'compose update scope must be qfli-terminal');
+check(/127\.0\.0\.1:\$\{QFLI_TERMINAL_HOST_PORT:-3101\}:3101/.test(compose),
+  'compose must publish the configurable loopback host port onto the fixed container port 3101');
+check(!/127\.0\.0\.1:3101:3101/.test(compose), 'compose must not hard-code the default host port');
+check(!/0\.0\.0\.0:\$\{QFLI_TERMINAL_HOST_PORT|:0\.0\.0\.0:3101/.test(compose),
+  'compose must never publish the executor beyond loopback');
+const updater = compose.slice(compose.indexOf('  watchtower:'));
+check(/\n    profiles:\s*\n\s*- auto-update\s*\n/.test(updater),
+  'watchtower must live in the optional auto-update profile');
+check(!/\n    profiles:/.test(compose.slice(0, compose.indexOf('  watchtower:'))),
+  'only the updater may sit behind the auto-update profile');
 check(/docker\.cnb\.cool\/azurekiln\/azurekiln-qfli-terminal:latest/.test(compose),
   'compose default executor image must target standalone azurekiln-qfli-terminal');
 check(!/qflistudio-next/.test(compose + envExample + bootstrap + cnbCi + githubCi + gitlabCi),
@@ -54,6 +64,10 @@ check(/ghcr\.io\/azurekiln2333\/azurekiln-qfli-terminal\/sandbox:3/.test(envExam
   '.env.example must document the GHCR sandbox fallback');
 check(/ghcr\.io\/azurekiln2333\/azurekiln-qfli-terminal:latest/.test(envExample),
   '.env.example must document the GHCR executor fallback');
+check(/^# QFLI_TERMINAL_HOST_PORT=3101$/m.test(envExample),
+  '.env.example must document the loopback host port and its 3101 default');
+check(/^# COMPOSE_PROFILES=auto-update$/m.test(envExample),
+  '.env.example must document COMPOSE_PROFILES=auto-update as the updater opt-in');
 
 check(/CNB_REPO_SLUG_LOWERCASE/.test(cnbCi), 'CNB CI must namespace images by CNB_REPO_SLUG_LOWERCASE');
 check(/services:\s*\n\s*- docker/.test(cnbCi), 'CNB publish pipeline needs the docker service');

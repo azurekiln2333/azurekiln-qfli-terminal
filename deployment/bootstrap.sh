@@ -10,10 +10,17 @@ umask 077
 runner=qfli-runner
 business_env=''
 input_source=''
+input_port=''
+input_port_set=0
 registry_mirror=''
 sandbox_image=docker.cnb.cool/azurekiln/azurekiln-qfli-terminal/sandbox:3
 executor_image=docker.cnb.cool/azurekiln/azurekiln-qfli-terminal:latest
+watchtower_image=nickfedor/watchtower:1.23.2
 sandbox_image_set=0
+executor_image_set=0
+watchtower_image_set=0
+auto_update_input=''
+default_host_port=3101
 release_entries=(docker-compose.yaml .env.example deployment/docker-daemon.json \
   deployment/qfli-terminal-compose.service deployment/check-health.mjs \
   deployment/verify-runtime.mjs)
@@ -21,9 +28,14 @@ release_entries=(docker-compose.yaml .env.example deployment/docker-daemon.json 
 usage() {
   printf '%s\n' \
     'Usage: bash deployment/bootstrap.sh [--source-dir PATH] [--business-env PATH]' \
-    '       [--registry-mirror HTTPS_URL] [--sandbox-image IMAGE] [--executor-image IMAGE]' \
+    '       [--port PORT] [--registry-mirror HTTPS_URL] [--sandbox-image IMAGE]' \
+    '       [--executor-image IMAGE] [--watchtower-image IMAGE]' \
+    '       [--auto-update | --no-auto-update]' \
     'Run as root on Ubuntu 24.04 or Alibaba Cloud Linux 3 with cgroup v2.' \
     'The sandbox and executor images are pulled; nothing is built on the server.' \
+    '--source-dir is optional: a complete checkout in the current directory,' \
+    'next to this script, or the installed project is used instead.' \
+    '--port sets the loopback executor port (1024-65535, default 3101).' \
     'An existing backend secret is required.'
 }
 
@@ -41,7 +53,241 @@ cleanup() {
     rm -f -- "$download_dir/gvisor.tar.zstd" "$download_dir/gvisor.tar.zstd.sha512"
     rmdir -- "$download_dir" 2>/dev/null || true
   fi
+  # The staged release copy is the only runner-readable source the installer
+  # needs for root-only checkouts; it never outlives the run.
+  if [[ -n "${stage_dir:-}" && "$stage_dir" == /var/tmp/qfli-terminal-release.* ]]; then
+    rm -rf -- "$stage_dir"
+  fi
 }
+
+# Sourcing this file defines the helpers
+# and `main` without running the installer, so the regression tests can drive
+# each branch without root, systemd, Docker or a real account. Executing the
+# file runs `main` exactly once at the bottom.
+
+qfli_image_pattern='^[a-z0-9][a-z0-9._/:@-]{0,250}$'
+
+read_env_value() {
+  local file=$1 key=$2 line
+  [[ -f "$file" ]] || return 0
+  line=$(grep -m1 "^${key}=" "$file" 2>/dev/null || true)
+  printf '%s' "${line#*=}" | tr -d '\r'
+}
+
+qfli_validate_port() {
+  local port=${1:-}
+  [[ "$port" =~ ^[1-9][0-9]{3,4}$ ]] || return 1
+  ((port >= 1024 && port <= 65535))
+}
+
+qfli_host_port() {
+  # INSTALLED_ENV_FILE (optional). --port wins, then the installed
+  # QFLI_TERMINAL_HOST_PORT, then the documented default. A corrupt installed
+  # value is an error, never a silent fallback to another port.
+  local installed_file=${1:-} installed=''
+  if [[ -n "$installed_file" ]]; then
+    installed=$(read_env_value "$installed_file" QFLI_TERMINAL_HOST_PORT)
+  fi
+  if [[ -n "${input_port:-}" ]]; then
+    qfli_validate_port "$input_port" || return 1
+    printf '%s\n' "$input_port"
+    return 0
+  fi
+  if [[ -n "$installed" ]]; then
+    qfli_validate_port "$installed" || return 1
+    printf '%s\n' "$installed"
+    return 0
+  fi
+  printf '%s\n' "$default_host_port"
+}
+
+qfli_is_published_image() {
+  # Registry-qualified reference: the first segment must be a real registry host
+  # (a dot, a port, or localhost). Bare names and Docker Hub shorthand are
+  # rejected, so a legacy local or namespaced build can never become an
+  # implicit sandbox or executor default. The updater keeps its own deliberate
+  # shorthand default and does not use this check.
+  local ref=${1:-} host
+  [[ "$ref" == */* ]] || return 1
+  host=${ref%%/*}
+  [[ "$host" == localhost || "$host" == *.* || "$host" == *:* ]]
+}
+
+qfli_release_incomplete() {
+  # Prints the first missing allowlisted entry; nonzero when the source is whole.
+  local dir=${1:-} entry
+  [[ -n "$dir" && -d "$dir" ]] || {
+    printf 'directory %s\n' "${dir:-<empty>}"
+    return 0
+  }
+  for entry in "${release_entries[@]}"; do
+    [[ -f "$dir/$entry" ]] || {
+      printf '%s\n' "$entry"
+      return 0
+    }
+  done
+  return 1
+}
+
+qfli_discover_source() {
+  # CWD SCRIPT_PATH INSTALLED_DIR. Explicit --source-dir > complete checkout in
+  # cwd > complete checkout next to the script > the installed project. Prints
+  # the chosen absolute directory and fails when none is complete.
+  local cwd=${1:-} script_path=${2:-} installed=${3:-} candidate script_parent=''
+  if [[ -n "${input_source:-}" ]]; then
+    printf '%s\n' "$input_source"
+    return 0
+  fi
+  if [[ -n "$script_path" ]]; then
+    script_parent=$(cd -P -- "$(dirname -- "$script_path")/.." 2>/dev/null && pwd) || script_parent=''
+  fi
+  for candidate in "$cwd" "$script_parent" "$installed"; do
+    [[ -n "$candidate" && -d "$candidate" ]] || continue
+    if ! qfli_release_incomplete "$candidate" >/dev/null; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+qfli_stage_release() {
+  # SOURCE_DIR [PARENT_DIR]. Copy only the allowlisted release files into a
+  # fresh qfli-terminal-release.XXXX directory that the runner can read, then
+  # print that path. A missing entry fails before anything is created, so the
+  # checkout (for example under /root) is never chmod-ed or copied wholesale.
+  local source=${1:-} parent=${2:-/var/tmp} entry stage
+  [[ -n "$source" && -d "$source" ]] || return 1
+  for entry in "${release_entries[@]}"; do
+    [[ -f "$source/$entry" ]] || return 1
+  done
+  stage=$(mktemp -d "$parent/qfli-terminal-release.XXXXXXXX") || return 1
+  # A failure below must not leave a half-staged directory behind.
+  if ! qfli_stage_release_into "$source" "$stage"; then
+    rm -rf -- "$stage"
+    return 1
+  fi
+  printf '%s\n' "$stage"
+}
+
+qfli_stage_release_into() {
+  local source=${1:-} stage=${2:-} entry dir
+  chmod 0755 -- "$stage" || return 1
+  while IFS= read -r dir; do
+    [[ -n "$dir" ]] || continue
+    mkdir -p -- "$stage/$dir" || return 1
+    chmod 0755 -- "$stage/$dir" || return 1
+  done < <(printf '%s\n' "${release_entries[@]}" | awk -F/ 'NF > 1 { sub("/[^/]+$", ""); print }' | sort -u)
+  for entry in "${release_entries[@]}"; do
+    install -m 0644 -- "$source/$entry" "$stage/$entry" || return 1
+    chmod 0644 -- "$stage/$entry" || return 1
+  done
+}
+
+qfli_delegation_dropin() {
+  # CPU/IO/memory/PID accounting needs the dedicated manager to delegate those
+  # controllers to the rootless engine's scope. cpuset is only accepted by
+  # systemd >= 244; older managers do not support delegating it.
+  local version=${1:-0} controllers='cpu io memory pids'
+  if [[ "$version" =~ ^[0-9]+$ ]] && ((version >= 244)); then
+    controllers='cpu io memory pids cpuset'
+  fi
+  printf '%s\n' '[Service]'
+  printf 'Delegate=%s\n' "$controllers"
+}
+
+qfli_cgroup_controllers_file() {
+  # cgroup v2 layout of the dedicated user manager. The root is an ordinary
+  # argument so tests can point at a fixture tree instead of the live host.
+  local uid=${1:-} root=${2:-/sys/fs/cgroup}
+  printf '%s/user.slice/user-%s.slice/user@%s.service/cgroup.controllers\n' \
+    "${root%/}" "$uid" "$uid"
+}
+
+qfli_check_delegation() {
+  # CGROUP_ROOT UID [SYSTEMD_VERSION]. Exit 0 only when the dedicated user
+  # manager really delegated cpu/io/memory/pids. cpuset is requested by the
+  # drop-in on systemd >= 244 but is not required: the budgets use CPU quota,
+  # memory and pids, not CPU affinity. Missing names go to stderr. The root is
+  # an ordinary argument so tests read a fixture tree; main passes the real one.
+  local root=${1:-/sys/fs/cgroup} uid=${2:-} version=${3:-0} name available file missing=''
+  local -a expected=(cpu io memory pids)
+  : "$version"
+  file=$(qfli_cgroup_controllers_file "$uid" "$root")
+  if [[ ! -r "$file" ]]; then
+    printf 'the delegated controller list is unreadable: %s\n' "$file" >&2
+    return 1
+  fi
+  available=" $(tr -s ' \n' ' ' < "$file") "
+  for name in "${expected[@]}"; do
+    case "$available" in
+      *" $name "*) ;;
+      *) missing+="$name " ;;
+    esac
+  done
+  if [[ -n "$missing" ]]; then
+    printf 'the dedicated user manager does not delegate: %s\n' "${missing% }" >&2
+    return 1
+  fi
+  return 0
+}
+
+qfli_updater_preflight() {
+  # IMAGE PULL_COMMAND. Exit 0 when the auto-update stack may start, nonzero
+  # with a reason on stderr when the updater image cannot be fetched. The
+  # caller treats a failure as "disable auto-update", never as "abort".
+  local image=${1:-} pull=${2:-docker}
+  [[ -n "$image" ]] || {
+    printf 'no updater image was configured\n' >&2
+    return 1
+  }
+  # The pull keeps its own stdout/stderr streaming so progress stays visible.
+  if "$pull" pull "$image"; then
+    return 0
+  fi
+  printf 'cannot pull the updater image %s\n' "$image" >&2
+  return 1
+}
+
+# Docker command handed to qfli_updater_preflight, which invokes it as
+# `<cmd> pull IMAGE`. Defined on top level next to the preflight that uses it,
+# and forwards every argument so the subcommand is never dropped.
+as_runner_pull() {
+  as_runner docker "$@"
+}
+
+# Run a command as the dedicated account with a fixed, minimal environment.
+# Reads runner/runner_uid/runner_home at call time, so it works from main.
+as_runner() {
+  # runuser keeps the caller's cwd; an unreadable one such as /root breaks find.
+  (
+    cd "$runner_home" || exit
+    exec runuser -u "$runner" -- env -i HOME="$runner_home" USER="$runner" LOGNAME="$runner" \
+      PATH=/usr/local/bin:/usr/bin:/bin \
+      XDG_RUNTIME_DIR="/run/user/$runner_uid" \
+      DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$runner_uid/bus" \
+      DOCKER_HOST="unix:///run/user/$runner_uid/docker.sock" "$@"
+  )
+}
+
+qfli_render_env() {
+  # The installed runner environment. COMPOSE_PROFILES selects the optional
+  # auto-update profile; an empty value keeps the executor stack alone.
+  local secret=${1:-} sandbox=${2:-} executor=${3:-} uid=${4:-} port=${5:-}
+  local auto_update=${6:-true} profiles=${7:-} watchtower=${8:-}
+  printf 'QFLI_TERMINAL_SECRET=%s\n' "$secret"
+  printf 'QFLI_TERMINAL_IMAGE=%s\n' "$sandbox"
+  printf 'QFLI_TERMINAL_SERVICE_IMAGE=%s\n' "$executor"
+  printf 'QFLI_RUNNER_HOST_UID=%s\n' "$uid"
+  printf 'QFLI_TERMINAL_HOST_PORT=%s\n' "$port"
+  printf 'QFLI_TERMINAL_AUTO_UPDATE=%s\n' "$auto_update"
+  printf 'COMPOSE_PROFILES=%s\n' "$profiles"
+  printf 'QFLI_TERMINAL_WATCHTOWER_IMAGE=%s\n' "$watchtower"
+}
+
+# Main entry point. The guard at the bottom runs it only when this file is
+# executed, so sourcing it stays side-effect free.
+main() {
 trap cleanup EXIT
 
 while (($#)); do
@@ -54,6 +300,12 @@ while (($#)); do
     --source-dir)
       (($# >= 2)) || fail '--source-dir requires a path'
       input_source=$2
+      shift 2
+      ;;
+    --port)
+      (($# >= 2)) || fail '--port requires a TCP port number'
+      input_port=$2
+      input_port_set=1
       shift 2
       ;;
     --registry-mirror)
@@ -70,7 +322,22 @@ while (($#)); do
     --executor-image)
       (($# >= 2)) || fail '--executor-image requires an image reference'
       executor_image=$2
+      executor_image_set=1
       shift 2
+      ;;
+    --watchtower-image)
+      (($# >= 2)) || fail '--watchtower-image requires an image reference'
+      watchtower_image=$2
+      watchtower_image_set=1
+      shift 2
+      ;;
+    --no-auto-update)
+      auto_update_input=false
+      shift
+      ;;
+    --auto-update)
+      auto_update_input=true
+      shift
       ;;
     -h|--help)
       usage
@@ -83,6 +350,16 @@ while (($#)); do
   esac
 done
 
+# Everything that can be rejected without touching the host is rejected first,
+# before the root check and before any package, account, service or container
+# changes, so a wrong invocation is rejected quickly and consistently.
+if ((input_port_set)); then
+  qfli_validate_port "$input_port" ||
+    fail "--port must be an integer between 1024 and 65535: $input_port"
+fi
+[[ "$sandbox_image" =~ $qfli_image_pattern ]] || fail 'invalid sandbox image reference'
+[[ "$executor_image" =~ $qfli_image_pattern ]] || fail 'invalid executor image reference'
+[[ "$watchtower_image" =~ $qfli_image_pattern ]] || fail 'invalid updater image reference'
 ((EUID == 0)) || fail 'run this installer as root'
 [[ -r /etc/os-release ]] || fail '/etc/os-release is missing'
 # This file is supplied by the operating system, not by the project checkout.
@@ -195,46 +472,79 @@ legacy_env="$runner_home/.config/qfli-terminal/runner.env"
 backup_dir="$runner_home/.config/qfli-terminal"
 installed_receipt="$backup_dir/installed.json"
 
-as_runner() {
-  # runuser keeps the caller's cwd; an unreadable one such as /root breaks find.
-  (
-    cd "$runner_home" || exit
-    exec runuser -u "$runner" -- env -i HOME="$runner_home" USER="$runner" LOGNAME="$runner" \
-      PATH=/usr/local/bin:/usr/bin:/bin \
-      XDG_RUNTIME_DIR="/run/user/$runner_uid" \
-      DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$runner_uid/bus" \
-      DOCKER_HOST="unix:///run/user/$runner_uid/docker.sock" "$@"
-  )
-}
-
 compose() {
-  as_runner docker compose --project-directory "$project_dir" "$@"
+  # COMPOSE_PROFILES from the installed .env selects the optional updater
+  # profile; pass it explicitly so ps/down/up agree even without the file.
+  local profiles=''
+  if [[ -f "$project_dir/.env" ]]; then
+    profiles=$(read_env_value "$project_dir/.env" COMPOSE_PROFILES)
+  fi
+  if [[ -n "$profiles" ]]; then
+    as_runner env COMPOSE_PROFILES="$profiles" docker compose --project-directory "$project_dir" "$@"
+  else
+    as_runner docker compose --project-directory "$project_dir" "$@"
+  fi
 }
 
-read_env_value() {
-  local file=$1 key=$2 line
-  [[ -f "$file" ]] || return 0
-  line=$(grep -m1 "^${key}=" "$file" 2>/dev/null || true)
-  printf '%s' "${line#*=}" | tr -d '\r'
-}
+# An implicit sandbox or executor default never comes from a bare legacy build
+# name: only an explicitly published registry reference is inherited.
+installed_sandbox_ref=$(read_env_value "$project_dir/.env" QFLI_TERMINAL_IMAGE)
+installed_executor_ref=$(read_env_value "$project_dir/.env" QFLI_TERMINAL_SERVICE_IMAGE)
+if ((!sandbox_image_set)) && qfli_is_published_image "$installed_sandbox_ref"; then
+  sandbox_image=$installed_sandbox_ref
+fi
+if ((!executor_image_set)) && qfli_is_published_image "$installed_executor_ref"; then
+  executor_image=$installed_executor_ref
+fi
+if ((!watchtower_image_set)); then
+  installed_watchtower=$(read_env_value "$project_dir/.env" QFLI_TERMINAL_WATCHTOWER_IMAGE)
+  if [[ "$installed_watchtower" =~ $qfli_image_pattern ]]; then
+    watchtower_image=$installed_watchtower
+  fi
+fi
+# Inherited values come from a file, so they are validated again before use:
+# a corrupted or injected line must not reach docker or the rendered .env.
+for inherited in "$sandbox_image" "$executor_image" "$watchtower_image"; do
+  [[ "$inherited" =~ $qfli_image_pattern ]] || fail "inherited image reference is invalid: $inherited"
+done
+unset inherited installed_sandbox_ref installed_executor_ref installed_watchtower
 
-[[ "$sandbox_image" =~ ^[a-z0-9][a-z0-9._/:@-]{0,250}$ ]] || fail 'invalid sandbox image reference'
-[[ "$executor_image" =~ ^[a-z0-9][a-z0-9._/:@-]{0,250}$ ]] || fail 'invalid executor image reference'
+# Port: --port, then the installed value, then 3101. A corrupt installed value
+# stops the run instead of silently moving the listening port.
+host_port=$(qfli_host_port "$project_dir/.env") ||
+  fail "--port and the installed QFLI_TERMINAL_HOST_PORT must be between 1024 and 65535"
+
+# Updater: --no-auto-update / --auto-update, then the installed value, then on.
+installed_auto_update=$(read_env_value "$project_dir/.env" QFLI_TERMINAL_AUTO_UPDATE)
+case "${auto_update_input:-$installed_auto_update}" in
+  false|0|no) auto_update=0 ;;
+  ''|true|1|yes) auto_update=1 ;;
+  *) fail "the installed QFLI_TERMINAL_AUTO_UPDATE is not a boolean: $installed_auto_update" ;;
+esac
 
 # Resolve the release source that provides docker-compose.yaml.
 if [[ -n "$input_source" ]]; then
-  input_source=$(realpath -- "$input_source")
+  resolved_source=$(realpath -- "$input_source" 2>/dev/null) || resolved_source=''
+  [[ -n "$resolved_source" && -d "$resolved_source" ]] ||
+    fail "source directory does not exist: $input_source"
+  input_source=$resolved_source
 fi
-release_source=${input_source:-}
-if [[ -z "$release_source" ]]; then
-  if [[ -f "$project_dir/docker-compose.yaml" ]]; then
-    release_source=$project_dir
-  else
-    fail 'pass --source-dir with a directory that contains docker-compose.yaml'
-  fi
-fi
+source_root=$(qfli_discover_source "$(pwd -P)" "${BASH_SOURCE[0]:-}" "$project_dir") ||
+  fail 'pass --source-dir with a directory that contains docker-compose.yaml'
+missing_entry=$(qfli_release_incomplete "$source_root") || missing_entry=''
+[[ -z "$missing_entry" ]] || fail "source is incomplete: missing $source_root/$missing_entry"
+
+# Stage the allowlisted release files where the dedicated account can read them.
+# Root-only and other unreadable checkouts work without touching the checkout.
+step "staging the release files from $source_root"
+stage_dir=$(qfli_stage_release "$source_root") ||
+  fail "cannot stage the release files from $source_root"
+release_source=$stage_dir
+# Re-run discovery against the staged copy: the account installs only from here.
 for entry in "${release_entries[@]}"; do
-  [[ -f "$release_source/$entry" ]] || fail "source is incomplete: missing $release_source/$entry"
+  [[ -f "$release_source/$entry" ]] || fail "staged release is incomplete: missing $release_source/$entry"
+  [[ "$(as_runner test -r "$release_source/$entry" && printf yes)" == yes ]] ||
+    fail "the staged release is not readable by $runner: $entry"
 done
 
 step 'starting the dedicated user manager'
@@ -304,11 +614,10 @@ current_secret=''
 if [[ -f "$project_dir/.env" ]]; then
   current_secret=$(read_env_value "$project_dir/.env" QFLI_TERMINAL_SECRET)
 elif [[ -f "$legacy_env" ]]; then
+  # Only the secret carries over from the legacy host install. A legacy
+  # QFLI_TERMINAL_IMAGE is usually a bare local build name, so it is ignored
+  # unless it was passed explicitly with --sandbox-image.
   current_secret=$(read_env_value "$legacy_env" QFLI_TERMINAL_SECRET)
-  legacy_sandbox=$(read_env_value "$legacy_env" QFLI_TERMINAL_IMAGE)
-  if ((!sandbox_image_set)) && [[ -n "$legacy_sandbox" ]]; then
-    sandbox_image=$legacy_sandbox
-  fi
 fi
 if [[ -n "${business_secret:-}" && -n "$current_secret" && "$business_secret" != "$current_secret" ]]; then
   fail 'business and runner secrets differ; reconcile them before continuing'
@@ -321,7 +630,7 @@ if [[ -z "$secret" ]]; then
 fi
 [[ "$secret" =~ ^[0-9a-fA-F]{64}$ ]] ||
   fail 'the installer requires the recommended 64-character hexadecimal shared secret'
-unset business_secret current_secret legacy_sandbox
+unset business_secret current_secret
 
 step 'preparing the compose project directory'
 [[ ! -L "$project_dir" ]] || fail "compose project must not be a symlink: $project_dir"
@@ -336,6 +645,39 @@ if [[ -e "$project_dir" ]]; then
 else
   as_runner install -d -m 0755 "$project_dir" || fail "cannot create $project_dir"
 fi
+
+step 'delegating the cgroup controllers to the dedicated user manager'
+# Rootless Docker with the systemd cgroup driver only enforces the account slice
+# when the dedicated user manager delegates the controllers. Without Delegate=
+# the engine cannot create scopes and cpu.io.memory.pids limits never apply.
+# cpuset delegation requires systemd 244 or newer.
+delegation_dropin="/etc/systemd/system/user@$runner_uid.service.d/90-qfli-delegation.conf"
+delegation_text=$(qfli_delegation_dropin "$systemd_version")
+install -d -m 0755 "/etc/systemd/system/user@$runner_uid.service.d"
+delegation_changed=0
+if [[ "$(cat "$delegation_dropin" 2>/dev/null)" != "$delegation_text" ]]; then
+  printf '%s\n' "$delegation_text" > "$delegation_dropin"
+  chmod 0644 "$delegation_dropin"
+  delegation_changed=1
+fi
+# Check the controllers the manager actually published, not just the drop-in
+# text: a manager started before the change keeps the old set. A drop-in change
+# only needs daemon-reload; the user manager is restarted solely when a required
+# controller is still missing. The first probe is expected to fail on a fresh
+# host, so its diagnostic is suppressed; the repair below reports the real one.
+delegation_ok=0
+qfli_check_delegation /sys/fs/cgroup "$runner_uid" "$systemd_version" 2>/dev/null && delegation_ok=1
+if ((delegation_changed)); then
+  systemctl daemon-reload
+fi
+if ((!delegation_ok)); then
+  step 'restarting the dedicated user manager for the delegated controllers'
+  systemctl daemon-reload
+  systemctl restart "user@$runner_uid.service"
+fi
+# The second probe is the real gate: its diagnostic reaches the operator.
+qfli_check_delegation /sys/fs/cgroup "$runner_uid" "$systemd_version" ||
+  fail 'the dedicated user manager did not delegate the required cgroup controllers'
 
 step 'checking the dedicated rootless Docker configuration'
 docker_config="$runner_home/.config/docker/daemon.json"
@@ -418,7 +760,7 @@ if ((docker_changed)) || ((!docker_active)); then
   as_runner systemctl --user restart docker.service
 fi
 docker_ready=0
-for attempt in {1..10}; do
+for _attempt in {1..10}; do
   if as_runner docker info --format '{{.CgroupVersion}}' >/dev/null 2>&1; then docker_ready=1; break; fi
   sleep 2
 done
@@ -446,12 +788,10 @@ if [[ -f "$runner_home/.config/systemd/user/qfli-terminal.service" ]] && \
   legacy_unit=1
 fi
 previous_executor_id=''
-previous_service_ref=''
-if [[ -f "$project_dir/.env" ]]; then
-  previous_service_ref=$(read_env_value "$project_dir/.env" QFLI_TERMINAL_SERVICE_IMAGE)
-fi
 if [[ -f "$project_dir/docker-compose.yaml" ]]; then
-  previous_container=$(compose ps -q executor 2>/dev/null || true)
+  # Include stopped containers: a failed upgrade leaves the previous executor
+  # exited, and its immutable image ID is exactly what rollback needs.
+  previous_container=$(compose ps --all -q executor 2>/dev/null || true)
   if [[ -n "$previous_container" ]]; then
     previous_executor_id=$(as_runner docker inspect --format '{{.Image}}' "$previous_container" 2>/dev/null || true)
   fi
@@ -494,9 +834,24 @@ executor_id=$(as_runner docker image inspect --format '{{.Id}}' "$executor_image
 [[ "$sandbox_id" =~ ^sha256:[a-f0-9]{64}$ && "$executor_id" =~ ^sha256:[a-f0-9]{64}$ ]] ||
   fail 'pulled images do not expose immutable IDs'
 
+# Auto-update stays on unless the operator opted out or the updater image is
+# unavailable; the executor stack is installed either way.
+compose_profiles=''
+if ((auto_update)); then
+  step 'checking the optional updater image'
+  if qfli_updater_preflight "$watchtower_image" as_runner_pull; then
+    compose_profiles=auto-update
+  else
+    auto_update=0
+    step 'auto-update is disabled because the updater image could not be pulled; the executor is still installed'
+  fi
+fi
+auto_update_value=false
+if ((auto_update)); then auto_update_value=true; fi
+
 # An unchanged rerun must not restart Docker or replace running sandboxes.
-desired_env=$(printf 'QFLI_TERMINAL_SECRET=%s\nQFLI_TERMINAL_IMAGE=%s\nQFLI_TERMINAL_SERVICE_IMAGE=%s\nQFLI_RUNNER_HOST_UID=%s' \
-  "$secret" "$sandbox_image" "$executor_image" "$runner_uid")
+desired_env=$(qfli_render_env "$secret" "$sandbox_image" "$executor_image" "$runner_uid" \
+  "$host_port" "$auto_update_value" "$compose_profiles" "$watchtower_image")
 current_env=$(cat "$project_dir/.env" 2>/dev/null || true)
 current_receipt=$(cat "$installed_receipt" 2>/dev/null || true)
 if [[ -f "$project_dir/.env" && -f "$project_dir/docker-compose.yaml" ]] && \
@@ -505,7 +860,7 @@ if [[ -f "$project_dir/.env" && -f "$project_dir/docker-compose.yaml" ]] && \
    [[ "$current_receipt" == *"\"sandboxId\":\"$sandbox_id\""* ]] && \
    [[ "$current_receipt" == *"\"executorId\":\"$executor_id\""* ]] && \
    compose exec -T executor node deployment/check-health.mjs >/dev/null 2>&1; then
-  step 'installed images, compose file and secret already match; nothing to change'
+  step 'installed images, compose file and settings already match; nothing to change'
   compose exec -T executor node deployment/check-health.mjs
   exit 0
 fi
@@ -583,8 +938,10 @@ if ((legacy_unit)) && as_runner systemctl --user is-active --quiet qfli-terminal
   as_runner systemctl --user disable --now qfli-terminal.service
 fi
 
-printf 'QFLI_TERMINAL_SECRET=%s\nQFLI_TERMINAL_IMAGE=%s\nQFLI_TERMINAL_SERVICE_IMAGE=%s\nQFLI_RUNNER_HOST_UID=%s\n' \
-  "$secret" "$sandbox_image" "$executor_image" "$runner_uid" |
+# One writer for the whole runner environment: the port, the updater settings
+# and COMPOSE_PROFILES are preserved across reruns through this file.
+qfli_render_env "$secret" "$sandbox_image" "$executor_image" "$runner_uid" \
+  "$host_port" "$auto_update_value" "$compose_profiles" "$watchtower_image" |
   as_runner sh -c '
     set -eu
     umask 077
@@ -608,7 +965,7 @@ compose up -d --remove-orphans || { restore_previous; fail 'the executor stack f
 
 step 'waiting for the authenticated local health check'
 healthy=0
-for attempt in {1..15}; do
+for _attempt in {1..15}; do
   if compose exec -T executor node deployment/check-health.mjs >/dev/null 2>&1; then
     compose exec -T executor node deployment/check-health.mjs
     healthy=1
@@ -637,8 +994,23 @@ printf '{"executorImage":"%s","executorId":"%s","sandboxImage":"%s","sandboxId":
   "$executor_image" "$executor_id" "$sandbox_image" "$sandbox_id" "$fingerprint" \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" |
   as_runner sh -c 'umask 077; cat > "$1"' sh "$installed_receipt"
-if [[ "$release_source" != "$project_dir" ]]; then
-  as_runner install -m 0644 "$release_source/.env.example" "$project_dir/.env.example"
-fi
+# Keep the installed project complete: a later rerun may have to fall back to
+# it as its only source, and it must still hold every allowlisted file. The
+# private .env is written above and is never overwritten here.
+as_runner install -d -m 0755 "$project_dir/deployment"
+for entry in "${release_entries[@]}"; do
+  [[ "$entry" == 'docker-compose.yaml' ]] && continue
+  as_runner install -m 0644 "$release_source/$entry" "$project_dir/$entry" ||
+    fail "cannot install $entry into $project_dir"
+done
+for entry in "${release_entries[@]}"; do
+  [[ -f "$project_dir/$entry" ]] || fail "the installed project is incomplete: missing $entry"
+done
 
 printf 'QFLI terminal setup: installed, verified and enabled at boot\n'
+}
+
+# Run only when executed. Sourcing (BASH_SOURCE != $0) only defines the helpers.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

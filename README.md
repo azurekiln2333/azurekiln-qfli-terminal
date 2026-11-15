@@ -17,32 +17,112 @@ App -> QFLI 业务 API -> 127.0.0.1:3101 执行服务
 
 ## 安装前先检查宿主
 
-执行机须为 x86_64、cgroup v2，且能运行带 `--ignore-cgroups` 的 gVisor。Alibaba Cloud Linux 3.2104 的 systemd 239 不支持 gVisor 自行创建 systemd cgroup，因此安装器改为让 gVisor 使用执行账号已有的受限 cgroup；不要求更换服务器或重装系统。Docker daemon 仍为 `qfli-runner` 账号的 rootless 服务。容器不声明虚假的独立 CPU/内存限额，执行服务会核对宿主上的实际账号限额及沙箱进程归属；核对失败就不开放终端。
+支持范围只有两种。
+Ubuntu 24.04 x86_64。
+Alibaba Cloud Linux 3 x86_64。
+两者都要 systemd 239 或更新。
+两者都要已启用的 cgroup v2。
+执行机还要能运行带 `--ignore-cgroups` 的 gVisor。
+其他发行版、其他架构不受支持。
+安装器在下载前就拒绝它们。
 
-先在执行机上运行 `systemctl --version | head -1` 和 `stat -fc %T /sys/fs/cgroup`；兼容路径支持 systemd 239 起的用户 slice 接口，cgroup 必须是 `cgroup2fs`。安装器在下载前检查系统和 cgroup 模式，按需准备专用账号、从属 UID/GID、Docker Engine/CLI/rootless extras 和系统依赖。实际兼容性以本文件开头的验收记录为准。
+Alibaba Cloud Linux 3.2104 的 systemd 239 不能自己建 systemd cgroup。
+安装器让 gVisor 用执行账号已有的受限 cgroup。
+不需要换服务器或重装系统。
+Docker daemon 仍是 `qfli-runner` 的 rootless 服务。
+沙箱使用执行账号的整体 CPU/内存限额。
+执行服务检查宿主账号限额与沙箱进程归属。
+检查失败就不开放终端。
 
-从可信的上传目录将**新版**安装器复制到仅 root 可写的位置。`--source-dir` 指向完整源码目录，安装器会将源码安装到执行账号的家目录；首次安装无需预先创建账号。以下是安装器入口，开放终端前仍须完成验收记录：
+先在执行机上确认两件事：
 
 ```sh
-install -o root -g root -m 0700 \
-  /实际上传目录/azurekiln-qfli-terminal/deployment/bootstrap.sh \
-  /root/qfli-terminal-bootstrap.sh
-bash /root/qfli-terminal-bootstrap.sh \
-  --source-dir /实际上传目录/azurekiln-qfli-terminal
+systemctl --version | head -1
+stat -fc %T /sys/fs/cgroup
 ```
 
-脚本会隐藏输入**业务后端已经使用的** 64 位十六进制终端密钥；不能在聊天或日志中粘贴密钥。已知业务 `.env` 路径时，也可运行 `bash /root/qfli-terminal-bootstrap.sh --business-env /实际业务后端目录/.env`，脚本只读取其中的 `QFLI_TERMINAL_SECRET`，不会复制业务配置到执行账号。若业务后端尚未配置终端密钥，先按下文“连接业务后端”配置两端相同的独立密钥。安装器不会替你修改或重启业务服务。
+第二条必须输出 `cgroup2fs`。
+安装器按需准备专用账号、从属 UID/GID、Docker 与系统依赖。
+真实兼容性以本文件开头的验收记录为准。
 
-升级会覆盖发布清单中的 `src`、`sandbox`、`deployment`、`test`、`docs`、`package.json`、`README.md` 和 `.env.example`，不跳过旧文件；独立配置目录中的密钥和业务数据不在复制清单中。安装器在停止旧服务前检查完整清单、目标路径类型、执行账号归属、写入与目录访问权限，并提前生成待复制的归档。预检失败会指出具体路径，保留旧服务的运行与启用状态。源码指纹包含整个发布清单。
-
-如果之前以 root 把源码解压到执行账号家目录，`tar: Cannot open: File exists`、`Cannot utime` 或 `Cannot change mode` 可能表示旧文件/目录无法由 `qfli-runner` 覆盖或修改属性，不代表应该跳过它们。先用 `ls -ld /home/qfli-runner/azurekiln-qfli-terminal{,/test,/docs}` 核对归属；确认是该专用源码目录后，以 root 修复归属并重跑新版安装器：
+以 root 在完整源码目录里直接运行安装器。首次安装无需预先创建执行账号。
 
 ```sh
-chown -h -R -P qfli-runner:"$(id -gn qfli-runner)" \
-  /home/qfli-runner/azurekiln-qfli-terminal
+cd /www/wwwroot/azurekiln-qfli-terminal
+bash deployment/bootstrap.sh
 ```
 
-`-h -R -P` 不递归跟随符号链接；若新版预检仍指出只读文件、不可访问目录或符号链接，按报出的具体路径修复。旧版若已经停服，修复后需让新版安装器完成验收，服务才会恢复。
+源码目录可以在 `/www/wwwroot`。源码目录也可以在 `/root`。
+安装器只复制发布清单列出的文件。
+安装器把文件放到执行账号可读的临时目录。
+不需要 `chmod` 源码目录。
+不需要手工复制仓库。
+
+安装器按顺序找源码：
+
+1. `--source-dir` 指定的目录。
+2. 当前目录里的完整仓库。
+3. 脚本所在仓库。
+4. 已安装的项目目录。
+
+显式传入的 `--source-dir` 优先。
+仓库不完整时安装器直接停止。
+安装器不会猜别的目录。
+
+常用可选参数：
+
+```sh
+bash deployment/bootstrap.sh \
+  --port 3102 \
+  --source-dir /www/wwwroot/azurekiln-qfli-terminal \
+  --business-env /www/wwwroot/azurekiln-qfli-server/.env
+```
+
+`--port` 改回环宿主端口。
+范围是 1024 到 65535，默认 3101。
+容器端口固定为 3101，只改宿主映射。
+安装器把端口写进已安装的 `.env`。
+重跑时沿用已安装的端口。
+
+镜像默认用已发布的 CNB 地址。
+换镜像仓库时才传覆盖参数：
+
+```sh
+bash deployment/bootstrap.sh \
+  --executor-image ghcr.io/azurekiln2333/azurekiln-qfli-terminal:latest \
+  --sandbox-image ghcr.io/azurekiln2333/azurekiln-qfli-terminal/sandbox:3
+```
+
+首次安装默认使用 CNB 镜像。
+重跑沿用已安装的镜像地址。
+该地址必须包含镜像仓库域名。
+安装器不会沿用裸的旧本地镜像名。
+要换镜像就显式传参数。
+命令行参数优先于已安装的配置。
+
+脚本会隐藏输入**业务后端已经使用的** 64 位十六进制终端密钥。
+不能在聊天或日志中粘贴密钥。
+已知业务 `.env` 路径时可传 `--business-env`。
+脚本只读取其中的 `QFLI_TERMINAL_SECRET`。
+业务配置不会复制到执行账号。
+若业务后端尚未配置终端密钥，先按下文“连接业务后端”配置两端相同的独立密钥。
+安装器不会替你修改或重启业务服务。
+
+升级会覆盖已安装项目目录中的发布清单文件，不跳过旧文件。
+密钥和业务数据在独立配置目录，不在复制清单中。
+安装器在停旧服务前检查清单、目标路径类型、归属与权限。
+预检失败会指出具体路径。
+预检失败时旧服务保持运行与启用。
+
+安装器先把清单文件拷到新的临时目录。
+执行账号可以读取发布清单文件。
+所以 root 权限的源码目录不需要改 `chmod`。
+旧版报过的 `tar: Cannot open: File exists` 属于旧的归档路径。
+新的暂存路径不走那个归档。
+若仍报只读文件或不可访问目录，按报出的具体路径修复已安装目录。
+已安装目录是 `/home/qfli-runner/qfli-terminal`。
+不要再把仓库解压到执行账号家目录。
+旧版若已经停服，修复后重跑安装器才会完成验收。
 
 当前安装器只拉取镜像，不在服务器上编译。
 它不下载 Node.js，也不构建沙箱镜像。
@@ -66,9 +146,7 @@ chown -h -R -P qfli-runner:"$(id -gn qfli-runner)" \
 在受支持的执行机升级旧版宿主服务时，该服务可能每 5 秒重启一次。
 原因是 Docker 启动失败。
 此时先以 root 停止该旧版专用用户服务。
-然后上传新版目录。
-再次复制安装器。
-最后启动安装器。
+然后在新版完整仓库里直接运行安装器。
 安装器会迁移旧的 `runsc --rootless=true` 与单文件日志压缩配置。
 安装器还会重启执行账号的 Docker。
 随后验证无网络的 gVisor 容器启动。
@@ -240,49 +318,79 @@ test -d /usr/local/bin/gvisor-bin
 
 校验失败时停止安装。该目录的 `deployment/docker-daemon.json` 已为专用 rootless Docker 注册运行时；不要对宿主的 root Docker 运行 `runsc install` 来替代此配置。安装后以 `qfli-runner` 重启其用户级 Docker，并确认 `runsc` 仍在运行时列表中。Docker daemon 本身仍以非 root 账号运行；不要向 `runsc` 传 `--rootless=true`，当前 gVisor 的 OCI `create` 命令会明确拒绝该参数。运行时传入 `--network=none --ignore-cgroups`，因此容器本身不声明独立限额；服务启动前必须通过实际的 gVisor 容器、进程所属账号 cgroup 和账号资源限额检查；失败时不切换到 `runc`。
 
-### 2. 设置执行账号整体资源上限
+### 2. 执行账号限额与 CPU 委派
 
-以 root 执行，根据专用账号的实际 UID 安装用户 slice 限额；例如当前服务器的 UID 为 `1003`，不要沿用别的机器上的数字：
+安装器写入限额并做 CPU 委派。
+本节命令只用于核对。
+限额写在持久 drop-in 里，重启后仍生效。
 
 ```sh
 runner_uid=$(id -u qfli-runner)
-install -d -m 0755 "/etc/systemd/system/user-$runner_uid.slice.d"
-install -m 0644 /home/qfli-runner/azurekiln-qfli-terminal/deployment/user-slice-limits.conf \
-  "/etc/systemd/system/user-$runner_uid.slice.d/limits.conf"
-systemctl daemon-reload
-systemctl set-property "user-$runner_uid.slice" \
-  CPUQuota=100% MemoryHigh=768M MemoryMax=1G MemorySwapMax=0 TasksMax=1024
 systemctl show "user-$runner_uid.slice" \
   -p CPUQuotaPerSecUSec -p MemoryMax -p MemorySwapMax -p TasksMax
 ```
 
-整个账号限制 1 核、1 GiB、无 swap、1024 tasks，覆盖 Docker daemon、gVisor、Node 与唯一用户会话。没有独立的每容器内存配额；实际总开销可能使账号到达上限。2 GiB 同机部署须监控账号用量、宿主剩余内存和业务数据库用量，大型编译容易触发限制。只配置专用执行账号的 slice。
+整个账号限制 1 核、1 GiB、无 swap、1024 tasks。
+限额覆盖 Docker daemon、gVisor、Node 与唯一用户会话。
+沙箱没有独立的每容器内存上限。
+实际总开销可能使账号到达上限。
+compose 另给执行器容器限额：内存 256 MiB、0.5 核、256 进程。
+容器限额不保证可用内存。
+容器仍受账号整体上限约束。
+2 GiB 同机部署须监控账号用量、宿主剩余内存和业务数据库用量。
+大型编译容易触发限制。
+只配置专用执行账号的 slice。
 
-### 3. 安装专用 rootless Docker
+rootless Docker 用 systemd cgroup 驱动。
+专用用户管理器必须把 CPU、内存、IO 与 PID 控制器委派给引擎。
+没有委派时引擎建不了 scope。
+此时 CPU、内存与 PID 限额不会生效。
+安装器写 `user@<UID>.service` 的 `Delegate=` drop-in。
+systemd 239 不支持 `cpuset` 委派。
+安装器在该版本只委派四个控制器。
+systemd 244 起再加上 `cpuset`。
+`cpuset` 不是必须项，因为限额靠配额而不是 CPU 亲和。
+安装器读管理器实际发布的控制器文件核对。
+核对路径是 `user.slice/user-<UID>.slice/user@<UID>.service/cgroup.controllers`。
+必要控制器缺失时才重启该用户管理器。
+只改配置字面不触发重启。
+重启后仍不通过就停止安装。
+核对命令：
 
 ```sh
-sudo -iu qfli-runner
-export XDG_RUNTIME_DIR=/run/user/$(id -u)
-export DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus
-if [ ! -e "$HOME/.config/systemd/user/docker.service" ]; then
-  dockerd-rootless-setuptool.sh install
-fi
-mkdir -p "$HOME/.config/docker"
+runner_uid=$(id -u qfli-runner)
+cat "/sys/fs/cgroup/user.slice/user-$runner_uid.slice/user@$runner_uid.service/cgroup.controllers"
 ```
 
-在执行账号的 `$HOME/.config/docker/daemon.json` 放入本项目 `deployment/docker-daemon.json`，然后：
+输出里必须有 `cpu io memory pids`。
+缺少任何一项就重新运行安装器。
+不要手改并声称限额已生效。
+只修专用执行账号，不修其他账号。
+
+### 3. 专用 rootless Docker
+
+安装器建专用账号与 rootless Docker。
+安装器写 `daemon.json` 并注册 `runsc`。
+本节命令只用于核对。
 
 ```sh
-systemctl --user daemon-reload
-systemctl --user enable docker.service
-systemctl --user restart docker.service
-export DOCKER_HOST=unix://$XDG_RUNTIME_DIR/docker.sock
-docker info
+runner_uid=$(id -u qfli-runner)
+runuser -u qfli-runner -- env XDG_RUNTIME_DIR=/run/user/$runner_uid \
+  DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$runner_uid/bus \
+  DOCKER_HOST=unix:///run/user/$runner_uid/docker.sock \
+  docker info
 ```
 
-必须确认 `rootless`、cgroup v2、seccomp 和 `runsc` 注册成功，不能忽略 `No cpu cfs quota support`、`No memory limit support` 等警告。这里的 Docker socket 位于 `/run/user/<UID>/docker.sock`，权限只能属于执行账号。Docker 信息仅证明运行时已注册；必须让 `runsc` 真正启动隔离容器，并核对有效的 cgroup 限额。检查失败时保持业务终端关闭，不通过去掉资源限制或切换普通 runtime 绕过检查。专用 Docker 的默认 `local` 日志驱动设置 `max-file=1` 时必须关闭压缩，否则 Docker 会在容器启动前报 `compression cannot be enabled when max file count is 1`；终端沙箱自身仍使用 `--log-driver=none`。
+需要 `rootless`、cgroup v2、seccomp 与 `runsc`。
+不要忽略 `No cpu cfs quota support` 这类警告。
+Docker socket 位于 `/run/user/<UID>/docker.sock`，权限只能属于执行账号。
+`docker info` 只证明运行时已注册。
+真正的限额必须由 `runsc` 启动的容器核对。检查失败时保持业务终端关闭，不通过去掉资源限制或切换普通 runtime 绕过检查。专用 Docker 的默认 `local` 日志驱动设置 `max-file=1` 时必须关闭压缩，否则 Docker 会在容器启动前报 `compression cannot be enabled when max file count is 1`；终端沙箱自身仍使用 `--log-driver=none`。
 
-从 root 的宝塔终端运行 `systemctl --user` 只会查询 root 的用户管理器，可能报 `Failed to connect to bus`，并不能说明 `qfli-runner` 服务状态。已有专用账号和 Docker socket 时，仍须切换到 `qfli-runner`，设置上面的 `XDG_RUNTIME_DIR` 与 `DBUS_SESSION_BUS_ADDRESS` 后查询其 `systemctl --user` 和 `journalctl --user`。
+从 root 的宝塔终端运行 `systemctl --user` 只会查询 root 的用户管理器。
+它可能报 `Failed to connect to bus`。
+这不能说明 `qfli-runner` 的服务状态。
+要查执行账号，切到 `qfli-runner` 并设好环境。
 
 ### 4. 拉取预构建镜像
 
@@ -298,12 +406,18 @@ CI 在可信流水线构建执行器镜像与沙箱镜像。生产服务器只�
 | GitCode / AtomGit | 只跑校验，不推镜像 | 无 | `.gitcode/workflows/verify.yml` |
 | Gitee | 无工作流 | 无 | 无 |
 
-默认安装器参数对应 CNB 镜像：
+默认安装器参数对应 CNB 镜像。在仓库目录里运行：
 
 ```sh
-bash /root/qfli-terminal-bootstrap.sh \
-  --source-dir /实际上传目录/azurekiln-qfli-terminal \
-  --business-env /实际业务后端目录/.env \
+cd /www/wwwroot/azurekiln-qfli-terminal
+bash deployment/bootstrap.sh --business-env /www/wwwroot/azurekiln-qfli-server/.env
+```
+
+要写明镜像时：
+
+```sh
+bash deployment/bootstrap.sh \
+  --business-env /www/wwwroot/azurekiln-qfli-server/.env \
   --executor-image docker.cnb.cool/azurekiln/azurekiln-qfli-terminal:latest \
   --sandbox-image docker.cnb.cool/azurekiln/azurekiln-qfli-terminal/sandbox:3
 ```
@@ -311,9 +425,8 @@ bash /root/qfli-terminal-bootstrap.sh \
 从 GitHub Container Registry 拉取：
 
 ```sh
-bash /root/qfli-terminal-bootstrap.sh \
-  --source-dir /实际上传目录/azurekiln-qfli-terminal \
-  --business-env /实际业务后端目录/.env \
+bash deployment/bootstrap.sh \
+  --business-env /www/wwwroot/azurekiln-qfli-server/.env \
   --executor-image ghcr.io/azurekiln2333/azurekiln-qfli-terminal:latest \
   --sandbox-image ghcr.io/azurekiln2333/azurekiln-qfli-terminal/sandbox:3
 ```
@@ -334,8 +447,15 @@ bash /root/qfli-terminal-bootstrap.sh \
 QFLI_TERMINAL_SECRET=<64 位十六进制密钥>
 QFLI_TERMINAL_IMAGE=<沙箱镜像>
 QFLI_TERMINAL_SERVICE_IMAGE=<执行器镜像>
+QFLI_TERMINAL_HOST_PORT=<回环宿主端口>
 QFLI_RUNNER_HOST_UID=<执行账号 UID>
+QFLI_TERMINAL_AUTO_UPDATE=<true 或 false>
+QFLI_TERMINAL_WATCHTOWER_IMAGE=<可选更新器镜像>
 ```
+
+`QFLI_TERMINAL_HOST_PORT` 默认 3101。
+改端口用 `--port`，不要手改 `.env`。
+下一轮安装会沿用已安装的端口。
 
 安装器按顺序执行：
 
@@ -369,7 +489,41 @@ runuser -u qfli-runner -- env XDG_RUNTIME_DIR=/run/user/$runner_uid \
   docker compose --project-directory /home/qfli-runner/qfli-terminal up -d executor
 ```
 
-compose 用 watchtower 观察本栈标签。执行器的更新范围是 `qfli-terminal`。业务栈的更新范围是 `qfli-server`。两套互不依赖，也没有 `depends_on`。
+compose 用 watchtower 观察本栈标签。
+执行器的更新范围是 `qfli-terminal`。
+业务栈的更新范围是 `qfli-server`。
+两套互不依赖，也没有 `depends_on`。
+
+#### 可选自动更新
+
+自动更新默认开启。
+关掉它：
+
+```sh
+bash deployment/bootstrap.sh --no-auto-update
+```
+
+换成别的更新器镜像：
+
+```sh
+bash deployment/bootstrap.sh \
+  --watchtower-image nickfedor/watchtower:1.23.2
+```
+
+安装器在替换执行器栈前先试拉更新器镜像。
+拉不到时只关掉自动更新。
+执行器照常安装。
+这一步不保证在所有服务改动之前。
+委派修复可能重启专用用户管理器。
+日志会写明自动更新已关闭。
+网络恢复后补上自动更新：
+
+```sh
+bash deployment/bootstrap.sh --auto-update
+```
+
+已安装的设置在重跑时沿用。
+命令行参数优先于已安装的设置。
 
 ### 6. 连接业务后端
 

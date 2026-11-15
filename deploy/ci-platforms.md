@@ -17,8 +17,21 @@
 ## CNB
 
 `.cnb.yml` 读取 `CNB_REPO_SLUG_LOWERCASE`、`CNB_COMMIT` 与 `CNB_BRANCH`。
-`services: [docker]` 自动登录 `docker.cnb.cool`，发布步骤传入 `--no-login`。
+`services: [docker]` 自动登录 `docker.cnb.cool`。
+发布步骤因此传 `--no-login`。
 每个执行 Node 脚本的任务都固定使用 `node:24.15.0-bookworm`。
+
+### 查看构建状态
+
+公开网页可看流水线：
+
+- `https://cnb.cool/azurekiln/azurekiln-qfli-terminal/-/pipelines`
+
+构建日志接口需要 API 授权：`GET /{repo}/-/build/logs`。
+接口定义在 `https://api.cnb.cool/swagger.json`。
+可用 `sha` 查询参数筛选本次提交。
+令牌需要读取构建日志的权限。
+无 API 令牌时可查看网页。
 
 ## GitHub Actions
 
@@ -43,7 +56,8 @@
 ## 服务器拉取
 
 生产机默认跟踪 CNB 镜像。
-切换到 GHCR 时修改 `bootstrap.sh` 参数或 `.env`，不改动 `docker-compose.yaml`：
+切换到 GHCR 时传安装器参数，不改 `docker-compose.yaml`。
+已安装机器也可以改 `.env`。
 
 ```sh
 # .env 覆盖示例
@@ -54,9 +68,9 @@ QFLI_TERMINAL_SERVICE_IMAGE=ghcr.io/azurekiln2333/azurekiln-qfli-terminal:latest
 直接使用安装器拉取 GHCR：
 
 ```sh
-bash /root/qfli-terminal-bootstrap.sh \
-  --source-dir /实际上传目录/azurekiln-qfli-terminal \
-  --business-env /实际业务后端目录/.env \
+cd /www/wwwroot/azurekiln-qfli-terminal
+bash deployment/bootstrap.sh \
+  --business-env /www/wwwroot/azurekiln-qfli-server/.env \
   --executor-image ghcr.io/azurekiln2333/azurekiln-qfli-terminal:latest \
   --sandbox-image ghcr.io/azurekiln2333/azurekiln-qfli-terminal/sandbox:3
 ```
@@ -66,3 +80,12 @@ bash /root/qfli-terminal-bootstrap.sh \
 - 分支 `main`：执行器推送 `sha-<12位提交>` 与 `latest`，沙箱推送 `sha-<12位提交>`、`3` 与 `latest`。
 - 标签 `vX.Y.Z`：执行器推送 `vX.Y.Z` 与 `latest`，沙箱推送 `vX.Y.Z`、`3` 与 `latest`。
 - 预发布 `vX.Y.Z-rc.1`：执行器推送同名标签，沙箱推送 `vX.Y.Z-rc.1-sandbox`，两者都不移动 `latest` 或 `3`。
+- 标签必须能通过 `SEMVER` 校验。
+- 非 `main` 分支不发布镜像。
+
+## 发布后校验
+
+- GitHub 用公开 REST 查：`https://api.github.com/repos/azurekiln2333/azurekiln-qfli-terminal/actions/runs`。
+- GitHub 标签用：`https://api.github.com/repos/azurekiln2333/azurekiln-qfli-terminal/tags`。
+- CNB 无 API 令牌时改看网页流水线页。
+- 发布结果须对应本次提交与标签。
