@@ -385,7 +385,15 @@ runuser -u qfli-runner -- env XDG_RUNTIME_DIR=/run/user/$runner_uid \
 不要忽略 `No cpu cfs quota support` 这类警告。
 Docker socket 位于 `/run/user/<UID>/docker.sock`，权限只能属于执行账号。
 `docker info` 只证明运行时已注册。
-真正的限额必须由 `runsc` 启动的容器核对。检查失败时保持业务终端关闭，不通过去掉资源限制或切换普通 runtime 绕过检查。专用 Docker 的默认 `local` 日志驱动设置 `max-file=1` 时必须关闭压缩，否则 Docker 会在容器启动前报 `compression cannot be enabled when max file count is 1`；终端沙箱自身仍使用 `--log-driver=none`。
+安装器用 `runsc` 容器检查实际限额。
+检查失败时保持业务终端关闭。
+不要移除资源限制。
+不要切换到普通运行时。
+专用 Docker 默认使用 `local` 日志驱动。
+设置 `max-file=1` 时必须关闭压缩。
+否则 Docker 在容器启动前报错：
+`compression cannot be enabled when max file count is 1`。
+终端沙箱仍使用 `--log-driver=none`。
 
 从 root 的宝塔终端运行 `systemctl --user` 只会查询 root 的用户管理器。
 它可能报 `Failed to connect to bus`。
